@@ -1,8 +1,9 @@
 """Extract narrative context docs into tabular rows for the per-task DuckDB warehouse.
 
-knowledge.md stays in the prompt and is never a table. Other .md/.txt files are
-split into paragraphs, schema-inferred from knowledge + samples, then extracted
-with the same chat model. Last / corrected values win. Table name = file stem.
+knowledge.md stays in the prompt and is never a table. Other .md/.txt files go
+through a document-level plan (record universe + schema + segments), then one
+isolated worker per segment. Rows merge on primary key into a wide table.
+Format conversion runs after extract in a subprocess. Table name = file stem.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -26,26 +28,110 @@ MAX_KNOWLEDGE_CHARS = 8000
 MAX_PARA_CHARS = 2000
 MIN_PARA_CHARS = 60
 MAX_SAMPLE_PARAS = 6
+MAX_PLAN_CHARS = 24000
+MAX_SEGMENTS = 40
+MAX_SEGMENT_CHARS = 8000
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", flags=re.DOTALL)
 _BLANK_RE = re.compile(r"\n\s*\n+")
 
-# Extraction is serial + paced by default: concurrent bursts trip API rate
-# limits, and the resulting 429 backoff storm costs far more wall-clock than
-# paced serial calls. Override via env when the quota allows more.
-EXTRACT_CONCURRENCY = max(1, int(os.environ.get("DATA_AGENT_EXTRACT_CONCURRENCY", "1") or "1"))
-EXTRACT_CALL_DELAY_SECONDS = max(
-    0.0, float(os.environ.get("DATA_AGENT_EXTRACT_DELAY", "0.5") or "0.5")
+# Small parallel batch extract. Cap at 4 — higher tends to 429 storms on MiniMax.
+EXTRACT_CONCURRENCY = max(
+    1, min(4, int(os.environ.get("DATA_AGENT_EXTRACT_CONCURRENCY", "2") or "2"))
 )
+# Optional healthy-path pacing. Default 0: only sleep on 429 backoff.
+EXTRACT_CALL_DELAY_SECONDS = max(
+    0.0, float(os.environ.get("DATA_AGENT_EXTRACT_DELAY", "0") or "0")
+)
+# Wall-clock budget for cold LLM extraction inside one task (seconds).
+EXTRACT_BUDGET_SECONDS = max(
+    30.0, float(os.environ.get("DATA_AGENT_EXTRACT_BUDGET", "180") or "180")
+)
+# Soft floor for paragraphs/batch (used when packing under time pressure / recovery).
+EXTRACT_BATCH_SIZE = max(
+    1, min(60, int(os.environ.get("DATA_AGENT_EXTRACT_BATCH_SIZE", "24") or "24"))
+)
+# Hard caps for char-aware packing (target ~4–8k chars of paragraph text / call).
+EXTRACT_BATCH_MAX_PARAS = max(
+    1, min(60, int(os.environ.get("DATA_AGENT_EXTRACT_BATCH_MAX_PARAS", "48") or "48"))
+)
+EXTRACT_BATCH_MAX_CHARS = max(
+    1000,
+    min(12000, int(os.environ.get("DATA_AGENT_EXTRACT_BATCH_MAX_CHARS", "6000") or "6000")),
+)
+# Conservative seconds/call used only for "can we finish?" preflight.
+EXTRACT_SEC_PER_CALL = max(
+    1.0, float(os.environ.get("DATA_AGENT_EXTRACT_SEC_PER_CALL", "8") or "8")
+)
+EXTRACT_429_BACKOFF_SECONDS = max(
+    0.5, float(os.environ.get("DATA_AGENT_EXTRACT_429_BACKOFF", "3") or "3")
+)
+# Serialize 429 backoff so concurrent workers do not stampede the API together.
+_RATE_LIMIT_LOCK = threading.Lock()
 
 # Extraction cache version. Bump ONLY when LLM-side extraction logic changes
 # (prompts, schema inference). Deterministic post-processing (e.g. Registry
 # official-name arbitration) never needs a bump: it is re-applied at load time.
-_EXTRACT_VERSION = 4
+_EXTRACT_VERSION = 6
 # Oldest reusable cache version. Accepted caches are upgraded deterministically
 # at load and re-saved at the current version, without any LLM call.
 # v1/v2 are included so scored runs never re-extract just because of an old
 # version stamp (that re-extract is the main cause of 300s warehouse timeouts).
 _MIN_CACHE_VERSION = 1
+
+_RATE_LIMIT_RE = re.compile(
+    r"\b429\b|rate[\s_-]?limit|insufficient[_\s]?quota|quota[\s_-]?exceeded|"
+    r"usage[\s_-]?limit|too many requests|tokens?\s+(?:exhausted|exceeded)|"
+    r"billing|credit|余额不足|用量超",
+    flags=re.IGNORECASE,
+)
+_TRANSIENT_RE = re.compile(
+    r"connection error|connect(?:ion)? timed? ?out|request timed out|"
+    r"read timed? ?out|timed? ?out|temporarily unavailable|"
+    r"reset by peer|connection reset|broken pipe|api connection|"
+    r"remote disconnected|server disconnected|ssl|eof occurred",
+    flags=re.IGNORECASE,
+)
+
+
+class DocumentExtractionError(RuntimeError):
+    """Cold extraction could not finish completely inside the budget / after 429."""
+
+
+@dataclass
+class ExtractionBudget:
+    """Shared deadline for all cold-extract LLM calls in one warehouse build."""
+
+    deadline: float
+    started_at: float
+
+    @classmethod
+    def from_env(cls, *, seconds: float | None = None) -> "ExtractionBudget":
+        now = time.perf_counter()
+        if seconds is None:
+            limit = max(1.0, float(EXTRACT_BUDGET_SECONDS))
+        else:
+            limit = max(0.0, float(seconds))
+        return cls(deadline=now + limit, started_at=now)
+
+    @property
+    def remaining(self) -> float:
+        return self.deadline - time.perf_counter()
+
+    def check(self, where: str) -> None:
+        if self.remaining <= 0:
+            elapsed = round(time.perf_counter() - self.started_at, 1)
+            raise DocumentExtractionError(
+                f"extract_timeout after {elapsed}s at {where}"
+            )
+
+
+def _is_rate_limit_error(text: str) -> bool:
+    return bool(_RATE_LIMIT_RE.search(text or ""))
+
+
+def _is_transient_error(text: str) -> bool:
+    """API blips that are worth one retry (not a hard 429 / quota fail)."""
+    return bool(_TRANSIENT_RE.search(text or ""))
 
 
 def stem_to_ident(stem: str) -> str:
@@ -75,6 +161,14 @@ class ExtractedDoc:
     primary_key: list[str]
     rows: list[dict[str, str]]
     report: ExtractionReport | None = None
+
+
+@dataclass
+class DocumentPlan:
+    columns: list[str]
+    primary_key: list[str]
+    record_keys: list[str]
+    segments: list[tuple[int, int]]
 
 
 def extract_cache_dir(context_dir: Path) -> Path:
@@ -225,14 +319,478 @@ def _sanitize_pk(raw_pk: Any, columns: list[str]) -> list[str]:
     return keys
 
 
-def _complete_json(model: ModelAdapter, prompt: str) -> dict[str, Any]:
+_CHATTER_COL_RE = re.compile(
+    r"^(memo|note|notes|comment|comments|toc|aside|chatter|boilerplate|"
+    r"narrative|remark|remarks|annotation)$",
+    flags=re.IGNORECASE,
+)
+_SUPERSEDED_COL_RE = re.compile(
+    r"^(original|initial|previous|formerly|listed_as|old|alias|nickname)_",
+    flags=re.IGNORECASE,
+)
+
+
+def _plan_document_text(paragraphs: list[str], *, limit: int = MAX_PLAN_CHARS) -> str:
+    numbered = [f"[{i + 1}] {para}" for i, para in enumerate(paragraphs)]
+    full = "\n\n".join(numbered)
+    if len(full) <= limit:
+        return full
+    # Keep every paragraph index (first 120 chars) plus full text of samples.
+    index_lines = [f"[{i + 1}] {para[:120]}" for i, para in enumerate(paragraphs)]
+    samples = _sample_paragraphs(paragraphs, limit=min(12, max(6, MAX_SAMPLE_PARAS * 2)))
+    sample_block = "\n\n".join(f"[full sample]\n{para}" for para in samples)
+    body = "Paragraph index (truncated):\n" + "\n".join(index_lines) + "\n\n" + sample_block
+    return body[:limit]
+
+
+def _coalesce_segments(segments: list[tuple[int, int]], limit: int = MAX_SEGMENTS) -> list[tuple[int, int]]:
+    if len(segments) <= limit:
+        return segments
+    total = segments[-1][1] - segments[0][0]
+    target = max(1, (total + limit - 1) // limit)
+    merged: list[tuple[int, int]] = []
+    start = segments[0][0]
+    end = start
+    for seg_start, seg_end in segments:
+        if end == start:
+            start, end = seg_start, seg_end
+            continue
+        if (seg_end - start) <= target:
+            end = seg_end
+        else:
+            merged.append((start, end))
+            start, end = seg_start, seg_end
+    merged.append((start, end))
+    return merged[:limit] if len(merged) > limit else merged
+
+
+def _fallback_segments(paragraphs: list[str]) -> list[tuple[int, int]]:
+    packed = _pack_paragraph_batches(
+        paragraphs,
+        max_paras=max(4, EXTRACT_BATCH_SIZE // 2),
+        max_chars=MAX_SEGMENT_CHARS,
+    )
+    return packed[:MAX_SEGMENTS] or ([(0, len(paragraphs))] if paragraphs else [])
+
+
+def parse_document_plan(payload: dict[str, Any], paragraph_count: int) -> DocumentPlan:
+    columns = _sanitize_columns(payload.get("columns"))
+    if not columns:
+        raise ValueError("plan has no columns")
+    primary_key = _sanitize_pk(payload.get("primary_key"), columns)
+    records_raw = payload.get("records") or payload.get("record_keys") or []
+    record_keys: list[str] = []
+    seen: set[str] = set()
+    if isinstance(records_raw, list):
+        for item in records_raw:
+            if isinstance(item, dict):
+                value = ""
+                if primary_key:
+                    value = str(item.get(primary_key[0], "") or "").strip()
+                if not value:
+                    value = str(next(iter(item.values()), "") or "").strip()
+            else:
+                value = str(item or "").strip()
+            if value and value not in seen:
+                seen.add(value)
+                record_keys.append(value)
+    segments: list[tuple[int, int]] = []
+    raw_segments = payload.get("segments")
+    if isinstance(raw_segments, list):
+        for item in raw_segments:
+            if isinstance(item, dict):
+                try:
+                    start = int(item.get("start") or item.get("para_start") or 0)
+                    end = int(item.get("end") or item.get("para_end") or 0)
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                try:
+                    start, end = int(item[0]), int(item[1])
+                except (TypeError, ValueError):
+                    continue
+            else:
+                continue
+            if start >= 1:
+                start0 = start - 1
+                end0 = end if end >= start else start
+            else:
+                start0 = max(0, start)
+                end0 = end
+            if end0 <= start0:
+                end0 = start0 + 1
+            segments.append((start0, end0))
+    # Fix 1-based inclusive end: if planner said start=1,end=8 then start=0, end=8 (exclusive ok)
+    cleaned: list[tuple[int, int]] = []
+    for start, end in segments:
+        start = max(0, min(start, paragraph_count - 1))
+        end = max(start + 1, min(end, paragraph_count))
+        cleaned.append((start, end))
+    if not cleaned:
+        raise ValueError("plan has no segments")
+    cleaned.sort(key=lambda item: item[0])
+    return DocumentPlan(
+        columns=columns,
+        primary_key=primary_key,
+        record_keys=record_keys,
+        segments=_coalesce_segments(cleaned),
+    )
+
+
+def _complete_json_validated(
+    model: ModelAdapter,
+    prompt: str,
+    *,
+    parse,
+    budget: ExtractionBudget | None = None,
+    where: str = "llm_call",
+):
+    """Call the model, validate, retry once on validation/parse failure."""
+    last_error: Exception | None = None
+    for attempt in (1, 2):
+        label = where if attempt == 1 else f"{where}:retry"
+        try:
+            payload = _complete_json(model, prompt, budget=budget, where=label)
+            return parse(payload)
+        except DocumentExtractionError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            continue
+    raise ValueError(str(last_error) if last_error else f"{where} validation failed")
+
+
+def plan_document(
+    model: ModelAdapter,
+    *,
+    stem: str,
+    paragraphs: list[str],
+    knowledge: str,
+    budget: ExtractionBudget | None = None,
+) -> DocumentPlan:
+    knowledge_block = knowledge.strip() or "(no knowledge.md)"
+    body = _plan_document_text(paragraphs)
+    prompt = f"""Read this document once and plan extraction for table `{stem}`.
+
+Return one JSON object:
+{{
+  "columns": [{{"name": "snake_case_col"}}],
+  "primary_key": ["id_column"],
+  "records": ["primary_key_value", ...],
+  "segments": [{{"start": 1, "end": 8}}, ...]
+}}
+
+Rules:
+- Prefer field names from knowledge.md.
+- records = the complete set of entity primary keys in the document (not samples).
+- segments are 1-based inclusive paragraph indices covering the document.
+- One segment should be a coherent slice (entity group or section), not the whole file.
+- Do not invent metrics. 4–20 columns.
+- knowledge.md excerpt:
+{knowledge_block}
+
+Numbered paragraphs:
+{body}
+"""
+
+    def _parse(payload: dict[str, Any]) -> DocumentPlan:
+        return parse_document_plan(payload, len(paragraphs))
+
+    return _complete_json_validated(
+        model, prompt, parse=_parse, budget=budget, where="extract_plan"
+    )
+
+
+def prune_extract_columns(
+    columns: list[str],
+    rows: list[dict[str, str]],
+    *,
+    primary_key: list[str],
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Drop chatter columns and originals superseded by a corrected column."""
+    kept: list[str] = []
+    pk = set(primary_key)
+    for col in columns:
+        if col in pk:
+            kept.append(col)
+            continue
+        if _CHATTER_COL_RE.match(col):
+            continue
+        if _SUPERSEDED_COL_RE.match(col):
+            continue
+        kept.append(col)
+    if not kept:
+        kept = list(columns)
+    pruned_rows = [{col: str(row.get(col, "") or "") for col in kept} for row in rows]
+    return kept, pruned_rows
+
+
+def _stub_missing_records(
+    rows: list[dict[str, str]],
+    *,
+    columns: list[str],
+    primary_key: list[str],
+    record_keys: list[str],
+) -> list[dict[str, str]]:
+    if not primary_key or not record_keys:
+        return rows
+    pk = primary_key[0]
+    seen = {str(row.get(pk, "") or "").strip() for row in rows}
+    extra: list[dict[str, str]] = []
+    for key in record_keys:
+        if key in seen:
+            continue
+        stub = {col: "" for col in columns}
+        stub[pk] = key
+        extra.append(stub)
+        seen.add(key)
+    return rows + extra
+
+
+def extract_segment_table(
+    model: ModelAdapter,
+    *,
+    columns: list[str],
+    primary_key: list[str],
+    paragraphs: list[str],
+    knowledge: str,
+    budget: ExtractionBudget | None = None,
+    where: str = "extract_segment",
+) -> list[dict[str, str]]:
+    """Extract one segment in isolation. Parse failure retries once, then keeps blanks."""
+    if not paragraphs:
+        return []
+    col_list = ", ".join(columns)
+    pk_list = ", ".join(primary_key) or "(none)"
+    knowledge_block = knowledge[:3000] if knowledge else "(no knowledge.md)"
+    numbered = "\n\n".join(f"[{index + 1}]\n{para}" for index, para in enumerate(paragraphs))
+    prompt = f"""Extract rows from this document segment into JSON.
+
+Return exactly:
+{{"rows": [{{"<col>": "<string>"}}, ...]}}
+
+Rules:
+- Keys must be a subset of: {col_list}
+- Primary key column(s): {pk_list}
+- Missing fields → ""
+- One row per entity mentioned. Same entity may appear again later; only fill fields this segment states.
+- If text says initially X then corrected/finalized Y, store Y.
+- Registry IDs / official names beat nicknames. Do not prepend general/former/foundational.
+- Do not invent facts. Ignore titles, TOC, memos with no entity.
+- knowledge.md excerpt:
+{knowledge_block}
+
+Segment:
+{numbered}
+"""
+
+    def _parse(payload: dict[str, Any]) -> list[dict[str, str]]:
+        raw_rows = payload.get("rows")
+        if raw_rows is None and isinstance(payload.get("records"), list):
+            raw_rows = []
+            for item in payload["records"]:
+                if isinstance(item, dict) and isinstance(item.get("values"), dict):
+                    raw_rows.append(item["values"])
+                elif isinstance(item, dict):
+                    raw_rows.append(item)
+        if not isinstance(raw_rows, list):
+            return []
+        parsed: list[dict[str, str]] = []
+        for item in raw_rows:
+            if not isinstance(item, dict):
+                continue
+            values = item.get("values") if isinstance(item.get("values"), dict) else item
+            row = _row_from_values(values, columns)
+            if row:
+                parsed.append(row)
+        return parsed
+
+    try:
+        return _complete_json_validated(
+            model, prompt, parse=_parse, budget=budget, where=where
+        )
+    except DocumentExtractionError:
+        raise
+    except Exception:
+        return []
+
+
+def _run_segment_workers(
+    model: ModelAdapter,
+    *,
+    paragraphs: list[str],
+    plan: DocumentPlan,
+    knowledge: str,
+    budget: ExtractionBudget,
+    source_rel: str,
+) -> tuple[list[dict[str, str]], bool]:
+    """Run one worker per segment. Returns (rows, all_segments_finished)."""
+    from data_agent_baseline.run.progress import mark as _mark
+
+    collected: list[dict[str, str]] = []
+    total = len(plan.segments)
+    if total == 0:
+        return [], False
+    workers = max(1, min(EXTRACT_CONCURRENCY, total))
+    _mark(
+        "extract_segments_start",
+        file=source_rel,
+        segments=total,
+        concurrency=workers,
+    )
+
+    def _one(index: int, start: int, end: int) -> list[dict[str, str]]:
+        chunk = paragraphs[start:end]
+        chars = sum(len(p) for p in chunk)
+        _mark(
+            "extract_segment",
+            file=source_rel,
+            segment=index,
+            total_segments=total,
+            paragraphs=len(chunk),
+            chars=chars,
+            budget_remaining=round(budget.remaining, 1),
+        )
+        return extract_segment_table(
+            model,
+            columns=plan.columns,
+            primary_key=plan.primary_key,
+            paragraphs=chunk,
+            knowledge=knowledge,
+            budget=budget,
+            where=f"extract_segment_{index}/{total}",
+        )
+
+    finished = 0
+    indexed = list(enumerate(plan.segments, start=1))
+    for wave_start in range(0, len(indexed), workers):
+        if budget.remaining <= 0:
+            return collected, False
+        wave = indexed[wave_start : wave_start + workers]
+        if workers == 1 or len(wave) == 1:
+            index, (start, end) = wave[0]
+            try:
+                collected.extend(_one(index, start, end))
+                finished += 1
+            except DocumentExtractionError:
+                return collected, False
+            continue
+        errors: list[BaseException] = []
+        with ThreadPoolExecutor(max_workers=len(wave), thread_name_prefix="extract") as pool:
+            futures = {
+                pool.submit(_one, index, start, end): index
+                for index, (start, end) in wave
+            }
+            for fut in as_completed(futures):
+                try:
+                    collected.extend(fut.result())
+                    finished += 1
+                except DocumentExtractionError as exc:
+                    errors.append(exc)
+                except Exception as exc:
+                    errors.append(exc)
+        if any(isinstance(exc, DocumentExtractionError) for exc in errors):
+            return collected, False
+    return collected, finished == total
+
+
+def declare_and_apply_formats(
+    model: ModelAdapter,
+    *,
+    columns: list[str],
+    rows: list[dict[str, str]],
+    budget: ExtractionBudget | None = None,
+) -> list[dict[str, str]]:
+    from data_agent_baseline.tools.extract_normalize import (
+        apply_column_converters,
+        parse_format_declarations,
+    )
+
+    if not rows or not columns:
+        return rows
+    samples: dict[str, list[str]] = {}
+    for col in columns:
+        seen: list[str] = []
+        for row in rows:
+            value = str(row.get(col, "") or "").strip()
+            if value and value not in seen:
+                seen.append(value)
+            if len(seen) >= 8:
+                break
+        samples[col] = seen
+    sample_block = json.dumps(samples, ensure_ascii=False)
+    prompt = f"""Declare target string formats for extracted columns. Do not convert the values.
+
+Return JSON:
+{{"formats": {{"<col>": {{"format": "iso_date|upper|lower|title|strip|digits", "code": "optional def convert(value): ..."}}}}}}
+
+Rules:
+- Only include columns that need normalization.
+- code if present must define convert(value) -> str.
+- knowledge of actual values:
+{sample_block}
+Columns: {", ".join(columns)}
+"""
+    try:
+        payload = _complete_json(
+            model, prompt, budget=budget, where="extract_normalize_declare"
+        )
+        converters = parse_format_declarations(payload, columns)
+    except DocumentExtractionError:
+        return rows
+    except Exception:
+        return rows
+    if not converters:
+        return rows
+    return apply_column_converters(rows, columns=columns, converters=converters)
+
+
+def _complete_json(
+    model: ModelAdapter,
+    prompt: str,
+    *,
+    budget: ExtractionBudget | None = None,
+    where: str = "llm_call",
+) -> dict[str, Any]:
     from data_agent_baseline.agents.model import ModelMessage
 
-    if EXTRACT_CALL_DELAY_SECONDS > 0:
-        # Pace every extraction LLM call (schema inference, per-paragraph, and
-        # recovery passes all funnel through here) to stay under rate limits.
-        time.sleep(EXTRACT_CALL_DELAY_SECONDS)
-    raw = model.complete([ModelMessage(role="user", content=prompt)])
+    def _once(*, pace: bool) -> str:
+        if budget is not None:
+            budget.check(where)
+        if pace and EXTRACT_CALL_DELAY_SECONDS > 0:
+            time.sleep(EXTRACT_CALL_DELAY_SECONDS)
+            if budget is not None:
+                budget.check(where)
+        return model.complete([ModelMessage(role="user", content=prompt)])
+
+    try:
+        raw = _once(pace=True)
+    except Exception as exc:
+        err = str(exc)
+        rate_limit = _is_rate_limit_error(err)
+        transient = _is_transient_error(err)
+        if not rate_limit and not transient:
+            raise
+        # One serialized backoff retry — concurrent workers share this lock so a
+        # 429 / connection blip does not fan out into a stampede.
+        label = "429_backoff" if rate_limit else "transient_backoff"
+        with _RATE_LIMIT_LOCK:
+            if budget is not None:
+                budget.check(f"{where}:{label}")
+            time.sleep(EXTRACT_429_BACKOFF_SECONDS)
+            try:
+                raw = _once(pace=False)
+            except Exception as retry_exc:
+                retry_err = str(retry_exc)
+                if _is_rate_limit_error(retry_err):
+                    raise DocumentExtractionError(
+                        f"rate_limit after one retry at {where}: {retry_err[:200]}"
+                    ) from retry_exc
+                if _is_transient_error(retry_err):
+                    raise DocumentExtractionError(
+                        f"transient after one retry at {where}: {retry_err[:200]}"
+                    ) from retry_exc
+                raise
     return parse_json_object(raw)
 
 
@@ -242,6 +800,7 @@ def infer_schema(
     stem: str,
     knowledge: str,
     samples: list[str],
+    budget: ExtractionBudget | None = None,
 ) -> tuple[list[str], list[str]]:
     sample_block = "\n\n".join(f"[sample {i + 1}]\n{para}" for i, para in enumerate(samples))
     knowledge_block = knowledge.strip() or "(no knowledge.md)"
@@ -266,12 +825,39 @@ Rules:
 Sample paragraphs:
 {sample_block}
 """
-    payload = _complete_json(model, prompt)
+    payload = _complete_json(model, prompt, budget=budget, where="infer_schema")
     columns = _sanitize_columns(payload.get("columns"))
     if not columns:
         raise ValueError("schema inference returned no columns")
     primary_key = _sanitize_pk(payload.get("primary_key"), columns)
     return columns, primary_key
+
+
+def _row_from_values(values: Any, columns: list[str]) -> dict[str, str] | None:
+    if not isinstance(values, dict):
+        return None
+    row = {col: "" for col in columns}
+    nonempty = False
+    for col in columns:
+        raw = values.get(col)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text.lower() in {
+            "nan",
+            "none",
+            "null",
+            "n/a",
+            "na",
+            "not available",
+            "not specified",
+            "pending",
+        }:
+            text = ""
+        if text:
+            row[col] = text
+            nonempty = True
+    return row if nonempty else None
 
 
 def extract_paragraph(
@@ -280,6 +866,7 @@ def extract_paragraph(
     columns: list[str],
     paragraph: str,
     knowledge: str,
+    budget: ExtractionBudget | None = None,
 ) -> dict[str, Any] | None:
     col_list = ", ".join(columns)
     knowledge_block = knowledge[:3000] if knowledge else "(no knowledge.md)"
@@ -307,27 +894,278 @@ Paragraph:
 {paragraph}
 """
     try:
-        payload = _complete_json(model, prompt)
+        payload = _complete_json(
+            model, prompt, budget=budget, where="extract_paragraph"
+        )
+    except DocumentExtractionError:
+        raise
     except Exception:
         return None
     if bool(payload.get("skip")):
         return None
-    values = payload.get("values")
-    if not isinstance(values, dict):
-        return None
-    row = {col: "" for col in columns}
-    nonempty = False
-    for col in columns:
-        raw = values.get(col)
-        if raw is None:
+    return _row_from_values(payload.get("values"), columns)
+
+
+def extract_paragraphs_batch(
+    model: ModelAdapter,
+    *,
+    columns: list[str],
+    paragraphs: list[str],
+    knowledge: str,
+    budget: ExtractionBudget | None = None,
+    batch_label: str = "extract_batch",
+) -> list[dict[str, str] | None]:
+    """Extract many paragraphs in one LLM call. Returns one slot per paragraph."""
+    if not paragraphs:
+        return []
+    col_list = ", ".join(columns)
+    knowledge_block = knowledge[:3000] if knowledge else "(no knowledge.md)"
+    numbered = "\n\n".join(
+        f"[{index + 1}]\n{para}" for index, para in enumerate(paragraphs)
+    )
+    prompt = f"""Extract one record per numbered paragraph into JSON.
+
+Return exactly:
+{{"records": [{{"index": 1, "skip": false, "values": {{"<col>": "<string>"}}}}, ...]}}
+
+Rules:
+- Include every paragraph index from 1 to {len(paragraphs)} exactly once.
+- Keys in values must be a subset of: {col_list}
+- Missing fields → ""
+- If a paragraph is a title, memo, TOC, or has no entity, set skip=true and values={{}}
+- If the text says initially / previously / listed as X and later corrected / finalized / now Y, store Y.
+- Registry IDs and official names beat informal nicknames.
+- When the paragraph uses "Name (Registry ID: …)" or "program for Name (Registry ID: …)", store Name exactly — do NOT prepend adjectives such as general / former / foundational / basic from nearby descriptive phrases.
+- Never store "general X" / "former X" when a Registry phrase already names the entity as X.
+- Extract every field that the paragraph provides. Do not invent facts absent from the paragraph.
+- Values are strings.
+
+knowledge.md excerpt:
+{knowledge_block}
+
+Paragraphs:
+{numbered}
+"""
+    try:
+        payload = _complete_json(model, prompt, budget=budget, where=batch_label)
+    except DocumentExtractionError:
+        raise
+    except Exception:
+        return [None] * len(paragraphs)
+
+    ordered: list[dict[str, str] | None] = [None] * len(paragraphs)
+    records = payload.get("records")
+    if not isinstance(records, list):
+        return ordered
+    for item in records:
+        if not isinstance(item, dict):
             continue
-        text = str(raw).strip()
-        if text.lower() in {"nan", "none", "null", "n/a", "na", "not available", "not specified", "pending"}:
-            text = ""
-        if text:
-            row[col] = text
-            nonempty = True
-    return row if nonempty else None
+        try:
+            index = int(item.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if index < 1 or index > len(paragraphs):
+            continue
+        if bool(item.get("skip")):
+            ordered[index - 1] = None
+            continue
+        ordered[index - 1] = _row_from_values(item.get("values"), columns)
+    return ordered
+
+
+def _pack_paragraph_batches(
+    paragraphs: list[str],
+    *,
+    max_paras: int | None = None,
+    max_chars: int | None = None,
+) -> list[tuple[int, int]]:
+    """Pack paragraphs into (start, end) slices by char budget and para cap.
+
+    Each batch aims to fill ``max_chars`` of paragraph text (plus light numbering
+    overhead) without exceeding ``max_paras`` items. A single oversized paragraph
+    always gets its own batch.
+    """
+    if not paragraphs:
+        return []
+    para_cap = max(1, int(max_paras if max_paras is not None else EXTRACT_BATCH_MAX_PARAS))
+    char_cap = max(1, int(max_chars if max_chars is not None else EXTRACT_BATCH_MAX_CHARS))
+    batches: list[tuple[int, int]] = []
+    index = 0
+    total = len(paragraphs)
+    while index < total:
+        end = index
+        used_chars = 0
+        while end < total and (end - index) < para_cap:
+            # Numbering wrapper "[n]\\n" ≈ 4–6 chars; keep a small fixed overhead.
+            piece = len(paragraphs[end]) + 6
+            if end > index and used_chars + piece > char_cap:
+                break
+            used_chars += piece
+            end += 1
+        if end == index:
+            end = index + 1
+        batches.append((index, end))
+        index = end
+    return batches
+
+
+def _preflight_can_finish(
+    batch_count: int, remaining_seconds: float, *, concurrency: int = 1
+) -> bool:
+    """Estimate wall-clock finishability (schema + parallel batch waves)."""
+    workers = max(1, concurrency)
+    wall_batches = (max(0, batch_count) + workers - 1) // workers
+    calls = 1 + wall_batches
+    return calls * EXTRACT_SEC_PER_CALL <= remaining_seconds
+
+
+def _plan_extract_batches(
+    paragraphs: list[str],
+    remaining_seconds: float,
+    *,
+    concurrency: int,
+) -> tuple[list[tuple[int, int]], int, int]:
+    """Pack paragraphs, widening char/para caps under time pressure if needed."""
+    candidates: list[tuple[int, int]] = [
+        (EXTRACT_BATCH_MAX_PARAS, EXTRACT_BATCH_MAX_CHARS),
+        (EXTRACT_BATCH_MAX_PARAS, 8000),
+        (56, 10000),
+        (60, 12000),
+    ]
+    seen: set[tuple[int, int]] = set()
+    best_ranges: list[tuple[int, int]] = []
+    best_limits = candidates[0]
+    for max_paras, max_chars in candidates:
+        key = (max_paras, max_chars)
+        if key in seen:
+            continue
+        seen.add(key)
+        ranges = _pack_paragraph_batches(
+            paragraphs, max_paras=max_paras, max_chars=max_chars
+        )
+        best_ranges = ranges
+        best_limits = (max_paras, max_chars)
+        if _preflight_can_finish(
+            len(ranges), remaining_seconds, concurrency=concurrency
+        ):
+            return ranges, max_paras, max_chars
+    return best_ranges, best_limits[0], best_limits[1]
+
+
+def _choose_batch_size(paragraph_count: int, remaining_seconds: float) -> int:
+    """Para cap under remaining budget (recovery path / simple callers)."""
+    if paragraph_count <= 0:
+        return EXTRACT_BATCH_SIZE
+    workers = 1
+    usable = max(0.0, remaining_seconds - EXTRACT_SEC_PER_CALL)
+    wall_slots = max(1, int(usable // EXTRACT_SEC_PER_CALL))
+    needed = (paragraph_count + wall_slots - 1) // wall_slots
+    return max(1, min(60, max(EXTRACT_BATCH_SIZE, needed)))
+
+
+def _run_first_pass_batches(
+    model: ModelAdapter,
+    *,
+    paragraphs: list[str],
+    batch_ranges: list[tuple[int, int]],
+    columns: list[str],
+    knowledge: str,
+    budget: ExtractionBudget,
+    source_rel: str,
+) -> tuple[list[dict[str, str] | None], str | None]:
+    """Extract packed batches. Returns (rows, incomplete_reason).
+
+    Incomplete means the first pass did not cover every paragraph. The caller
+    must discard these rows — never register or cache a partial document table.
+    Waves stop when the budget is gone so later batches are not submitted.
+    """
+    from data_agent_baseline.run.progress import mark as _mark
+
+    ordered: list[dict[str, str] | None] = [None] * len(paragraphs)
+    total_batches = len(batch_ranges)
+    if total_batches == 0:
+        return ordered, None
+
+    def _one(batch_index: int, start: int, end: int) -> tuple[int, list[dict[str, str] | None]]:
+        if budget.remaining <= 0:
+            raise DocumentExtractionError(
+                f"extract_timeout at extract_batch_{batch_index}/{total_batches}"
+            )
+        chunk = paragraphs[start:end]
+        _mark(
+            "extract_batch",
+            file=source_rel,
+            batch=batch_index,
+            total_batches=total_batches,
+            paragraphs=len(chunk),
+            chars=sum(len(p) for p in chunk),
+            budget_remaining=round(budget.remaining, 1),
+        )
+        rows = extract_paragraphs_batch(
+            model,
+            columns=columns,
+            paragraphs=chunk,
+            knowledge=knowledge,
+            budget=budget,
+            batch_label=f"extract_batch_{batch_index}/{total_batches}",
+        )
+        return start, rows
+
+    workers = max(1, min(EXTRACT_CONCURRENCY, total_batches))
+    _mark(
+        "extract_batches_start",
+        file=source_rel,
+        total_batches=total_batches,
+        concurrency=workers,
+    )
+    incomplete: str | None = None
+    indexed = list(enumerate(batch_ranges, start=1))
+    for wave_start in range(0, len(indexed), workers):
+        if budget.remaining <= 0:
+            incomplete = (
+                f"extract_timeout after {round(time.perf_counter() - budget.started_at, 1)}s "
+                f"before extract_batch_{indexed[wave_start][0]}/{total_batches}"
+            )
+            break
+        wave = indexed[wave_start : wave_start + workers]
+        if workers == 1 or len(wave) == 1:
+            batch_index, (start, end) = wave[0]
+            try:
+                start_idx, rows = _one(batch_index, start, end)
+            except DocumentExtractionError as exc:
+                incomplete = str(exc)
+                break
+            for offset, row in enumerate(rows):
+                ordered[start_idx + offset] = row
+            continue
+
+        errors: list[BaseException] = []
+        with ThreadPoolExecutor(max_workers=len(wave), thread_name_prefix="extract") as pool:
+            futures = [
+                pool.submit(_one, batch_index, start, end)
+                for batch_index, (start, end) in wave
+            ]
+            for fut in as_completed(futures):
+                try:
+                    start_idx, rows = fut.result()
+                except DocumentExtractionError as exc:
+                    errors.append(exc)
+                    continue
+                except Exception as exc:
+                    errors.append(exc)
+                    continue
+                for offset, row in enumerate(rows):
+                    ordered[start_idx + offset] = row
+        if errors:
+            timeout_exc = next(
+                (exc for exc in errors if isinstance(exc, DocumentExtractionError)),
+                None,
+            )
+            if timeout_exc is not None:
+                incomplete = str(timeout_exc)
+                break
+            # Non-timeout batch errors already mapped to empty slots; keep going.
+    return ordered, incomplete
 
 
 def merge_rows(
@@ -557,10 +1395,13 @@ def _extract_missing_key_paragraphs(
     columns: list[str],
     primary_key: list[str],
     knowledge: str,
+    budget: ExtractionBudget | None = None,
 ) -> list[dict[str, str]]:
     """Re-extract paragraphs whose primary key is missing from rows.
 
     This catches entities that the first per-paragraph pass failed to extract.
+    Stops early when the shared extract budget is exhausted (no partial failure:
+    the first pass already covered every paragraph).
     """
     pattern = _extract_key_pattern(rows, primary_key)
     if pattern is None:
@@ -569,7 +1410,8 @@ def _extract_missing_key_paragraphs(
         tuple(str(row.get(col, "") or "").strip() for col in primary_key)
         for row in rows
     }
-    extra: list[dict[str, str]] = []
+    pending_paras: list[str] = []
+    pending_keys: list[str] = []
     for para in paragraphs:
         for match in pattern.finditer(para):
             key_value = match.group(1)
@@ -577,17 +1419,39 @@ def _extract_missing_key_paragraphs(
             if key_tuple in existing_keys:
                 continue
             existing_keys.add(key_tuple)
-            row = extract_paragraph(
+            pending_paras.append(para)
+            pending_keys.append(key_value)
+    if not pending_paras:
+        return []
+
+    extra: list[dict[str, str]] = []
+    remaining = budget.remaining if budget is not None else EXTRACT_BUDGET_SECONDS
+    batch_ranges, _max_paras, _max_chars = _plan_extract_batches(
+        pending_paras, remaining, concurrency=1
+    )
+    for batch_index, (start, end) in enumerate(batch_ranges, start=1):
+        if budget is not None and budget.remaining < EXTRACT_SEC_PER_CALL:
+            break
+        chunk = pending_paras[start:end]
+        key_chunk = pending_keys[start:end]
+        try:
+            batch_rows = extract_paragraphs_batch(
                 model,
                 columns=columns,
-                paragraph=para,
+                paragraphs=chunk,
                 knowledge=knowledge,
+                budget=budget,
+                batch_label=f"extract_recover_{batch_index}",
             )
-            if row is not None:
-                # Force the primary key value from the text.
-                if primary_key:
-                    row[primary_key[0]] = key_value
-                extra.append(row)
+        except DocumentExtractionError:
+            # Recovery is best-effort after a complete first pass.
+            break
+        for row, key_value in zip(batch_rows, key_chunk):
+            if row is None:
+                continue
+            if primary_key:
+                row[primary_key[0]] = key_value
+            extra.append(row)
     return extra
 
 
@@ -761,11 +1625,15 @@ def _upgrade_cached_doc(
         rows = apply_registry_official_names(
             paragraphs, [dict(row) for row in doc.rows], columns=doc.columns
         )
+        columns, rows = prune_extract_columns(
+            doc.columns, rows, primary_key=doc.primary_key
+        )
+        primary_key = [col for col in doc.primary_key if col in columns]
         upgraded = ExtractedDoc(
             stem=doc.stem,
             source_rel=doc.source_rel,
-            columns=doc.columns,
-            primary_key=doc.primary_key,
+            columns=columns,
+            primary_key=primary_key,
             rows=rows,
             report=doc.report,
         )
@@ -811,7 +1679,11 @@ def extract_document(
     path: Path,
     context_dir: Path,
     model: ModelAdapter | None,
+    *,
+    budget: ExtractionBudget | None = None,
 ) -> ExtractedDoc | None:
+    from data_agent_baseline.run.progress import mark as _mark
+
     source_rel = str(path.relative_to(context_dir)).replace("\\", "/")
     cache_file = _cache_path(context_dir, source_rel)
     cached = _load_cache(cache_file, _accepted_source_hashes(path, context_dir))
@@ -819,87 +1691,94 @@ def extract_document(
         doc, cache_version = cached
         if cache_version < _EXTRACT_VERSION:
             doc = _upgrade_cached_doc(doc, path, cache_file, context_dir)
+        _mark("extract_cache_hit", file=source_rel, rows=len(doc.rows))
         return doc
     if model is None:
         return None
     paragraphs = split_paragraphs(path.read_text(encoding="utf-8", errors="replace"))
     if not paragraphs:
         return None
+
+    active_budget = budget or ExtractionBudget.from_env()
     knowledge = _knowledge_excerpt(context_dir)
-    columns, primary_key = infer_schema(
-        model,
-        stem=path.stem,
-        knowledge=knowledge,
-        samples=_sample_paragraphs(paragraphs),
+    _mark(
+        "extract_plan",
+        file=source_rel,
+        paragraphs=len(paragraphs),
+        budget_remaining=round(active_budget.remaining, 1),
     )
-    ordered: list[dict[str, str] | None] = [None] * len(paragraphs)
-    workers = min(EXTRACT_CONCURRENCY, max(1, len(paragraphs)))
-    if workers == 1:
-        # Serial + paced: under rate limits this is faster than a concurrent
-        # burst that triggers 429 backoff, and it cannot burst-trip the limit.
-        for index, paragraph in enumerate(paragraphs):
-            try:
-                ordered[index] = extract_paragraph(
-                    model,
-                    columns=columns,
-                    paragraph=paragraph,
-                    knowledge=knowledge,
-                )
-            except Exception:
-                ordered[index] = None
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(
-                    extract_paragraph,
-                    model,
-                    columns=columns,
-                    paragraph=paragraph,
-                    knowledge=knowledge,
-                ): index
-                for index, paragraph in enumerate(paragraphs)
-            }
-            for future in as_completed(futures):
-                try:
-                    ordered[futures[future]] = future.result()
-                except Exception:
-                    ordered[futures[future]] = None
-    extracted = [row for row in ordered if row]
-    rows = merge_rows(extracted, columns=columns, primary_key=primary_key)
-    if not rows:
+    try:
+        plan = plan_document(
+            model,
+            stem=path.stem,
+            paragraphs=paragraphs,
+            knowledge=knowledge,
+            budget=active_budget,
+        )
+    except Exception as exc:
+        _mark("extract_doc_abandoned", file=source_rel, error=str(exc)[:300], stage="plan")
+        return None
+    if not plan.segments:
+        plan.segments = _fallback_segments(paragraphs)
+    _mark(
+        "extract_plan_done",
+        file=source_rel,
+        columns=len(plan.columns),
+        records=len(plan.record_keys),
+        segments=len(plan.segments),
+    )
+
+    try:
+        segment_rows, complete = _run_segment_workers(
+            model,
+            paragraphs=paragraphs,
+            plan=plan,
+            knowledge=knowledge,
+            budget=active_budget,
+            source_rel=source_rel,
+        )
+    except Exception as exc:
+        _mark("extract_doc_abandoned", file=source_rel, error=str(exc)[:300], stage="segments")
+        return None
+    if not complete:
+        _mark(
+            "extract_doc_abandoned",
+            file=source_rel,
+            error="segments incomplete; will full-retry next run",
+            stage="segments",
+        )
         return None
 
-    # Second pass: recover entities that the independent per-paragraph extraction missed.
-    try:
-        missing_rows = _extract_missing_key_paragraphs(
-            model,
-            paragraphs,
-            rows,
-            columns=columns,
-            primary_key=primary_key,
-            knowledge=knowledge,
-        )
-        if missing_rows:
-            rows = merge_rows(rows + missing_rows, columns=columns, primary_key=primary_key)
-    except Exception:
-        pass
+    rows = merge_rows(segment_rows, columns=plan.columns, primary_key=plan.primary_key)
+    rows = _stub_missing_records(
+        rows,
+        columns=plan.columns,
+        primary_key=plan.primary_key,
+        record_keys=plan.record_keys,
+    )
+    if not rows:
+        _mark("extract_doc_abandoned", file=source_rel, error="no rows after merge", stage="merge")
+        return None
 
-    # Third pass (DISABLED): filling empty fields from later paragraphs risks
-    # overwriting official values with aliases or descriptive text (e.g.
-    # "Business" -> "General Business"). Keep the function for reference but do
-    # not invoke it. Missing entities are still recovered by the second pass.
-    # try:
-    #     rows = _fill_empty_fields(...)
-    # except Exception:
-    #     pass
-
-    # C1: Registry-phrase official names beat adjective-prefixed aliases.
     try:
         rows = apply_registry_official_names(
-            paragraphs, rows, columns=columns
+            paragraphs, rows, columns=plan.columns
         )
     except Exception:
         pass
+
+    try:
+        _mark("extract_normalize", file=source_rel)
+        rows = declare_and_apply_formats(
+            model, columns=plan.columns, rows=rows, budget=active_budget
+        )
+    except Exception:
+        pass
+
+    columns, rows = prune_extract_columns(
+        plan.columns, rows, primary_key=plan.primary_key
+    )
+    primary_key = [col for col in plan.primary_key if col in columns]
 
     report = _build_extraction_report(
         stem=path.stem,
@@ -908,7 +1787,6 @@ def extract_document(
         columns=columns,
         primary_key=primary_key,
     )
-
     doc = ExtractedDoc(
         stem=path.stem,
         source_rel=source_rel,
@@ -917,19 +1795,38 @@ def extract_document(
         rows=rows,
         report=report,
     )
+    source_hash = _source_hash(path, context_dir)
     _save_cache(_cache_path(context_dir, source_rel), doc, source_hash)
+    _mark(
+        "extract_saved",
+        file=source_rel,
+        rows=len(rows),
+        segments=len(plan.segments),
+        columns=len(columns),
+    )
     return doc
 
 
 def extract_all_documents(
     context_dir: Path,
     model: ModelAdapter | None,
+    *,
+    budget: ExtractionBudget | None = None,
 ) -> list[ExtractedDoc]:
+    from data_agent_baseline.run.progress import mark as _mark
+
+    active_budget = budget or ExtractionBudget.from_env()
     docs: list[ExtractedDoc] = []
     for path in collect_doc_paths(context_dir):
         try:
-            extracted = extract_document(path, context_dir, model)
-        except Exception:
+            extracted = extract_document(
+                path, context_dir, model, budget=active_budget
+            )
+        except DocumentExtractionError as exc:
+            _mark("extract_doc_abandoned", file=path.name, error=str(exc)[:300])
+            continue
+        except Exception as exc:
+            _mark("extract_doc_abandoned", file=path.name, error=str(exc)[:300])
             continue
         if extracted is not None and extracted.rows:
             docs.append(extracted)

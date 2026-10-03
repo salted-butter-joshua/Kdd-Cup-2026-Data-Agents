@@ -200,8 +200,8 @@ class ReActAgent:
             return ""
         from data_agent_baseline.tools.warehouse import format_table_schema
 
-        # force_rebuild clears context/db/warehouse.duckdb so every run/retry
-        # starts with an empty on-disk warehouse (avoids stale files + RAM growth).
+        # force_rebuild rebuilds an in-memory warehouse (legacy on-disk leftovers and
+        # spill tmp cleared) so every run/retry starts clean.
         return format_table_schema(session.for_task(task, force_rebuild=True))
 
     def _prepare_schema_link(
@@ -285,6 +285,8 @@ class ReActAgent:
         return messages
 
     def run(self, task: PublicTask) -> AgentRunResult:
+        from data_agent_baseline.run.progress import mark as _mark
+
         state = AgentRuntimeState()
         knowledge_text = ""
         schema_text = ""
@@ -298,8 +300,10 @@ class ReActAgent:
         self._schema_link: SchemaLinkPlan | None = None
         self._normalize_plan = normalize_plan
         try:
+            _mark("prepare_knowledge")
             knowledge_text = self._prepare_knowledge(task)
             self._knowledge_text = knowledge_text
+            _mark("prepare_knowledge_done")
         except Exception as exc:  # noqa: BLE001
             knowledge_text = ""
             state.steps.append(
@@ -314,8 +318,12 @@ class ReActAgent:
                 )
             )
         try:
+            _mark("prepare_schema")
             schema_text = self._prepare_schema(task)
+            _mark("prepare_schema_done", schema_chars=len(schema_text or ""))
         except Exception as exc:  # noqa: BLE001
+            from data_agent_baseline.tools.doc_extract import DocumentExtractionError
+
             schema_text = ""
             state.steps.append(
                 StepRecord(
@@ -328,15 +336,20 @@ class ReActAgent:
                     ok=False,
                 )
             )
+            if isinstance(exc, DocumentExtractionError):
+                # Extract is isolated from ReAct: skip failed docs, keep csv/json/sqlite.
+                _mark("prepare_schema_extract_failed", error=str(exc)[:300])
 
         # L1.0 value normalization plan (soft anchor for literal ↔ stored alignment).
         try:
+            _mark("prepare_normalize")
             normalize_plan = build_normalize_plan(
                 question=task.question,
                 knowledge_text=knowledge_text,
             )
             self._normalize_plan = normalize_plan
             normalize_text = format_normalize_plan(normalize_plan)
+            _mark("prepare_normalize_done")
         except Exception as exc:  # noqa: BLE001
             state.steps.append(
                 StepRecord(
@@ -352,6 +365,7 @@ class ReActAgent:
 
         # L0.5 schema linking + L1.5 hypothesis plan (soft anchors for ReAct).
         try:
+            _mark("prepare_schema_link")
             link = self._prepare_schema_link(task, knowledge_text=knowledge_text)
             self._schema_link = link
             if link is not None:
@@ -365,6 +379,7 @@ class ReActAgent:
                     link=link,
                 )
                 hypothesis_text = format_hypothesis_plan(hypotheses)
+            _mark("prepare_schema_link_done")
         except Exception as exc:  # noqa: BLE001
             state.steps.append(
                 StepRecord(
@@ -381,6 +396,7 @@ class ReActAgent:
         for step_index in range(1, self.config.max_steps + 1):
             raw_response = ""
             try:
+                _mark("react_model_call", step=step_index)
                 raw_response = self.model.complete(
                     self._build_messages(
                         task,
@@ -395,8 +411,11 @@ class ReActAgent:
                         normalize_plan=normalize_plan,
                     )
                 )
+                _mark("react_model_done", step=step_index, response_chars=len(raw_response or ""))
                 model_step = parse_model_step(raw_response)
+                _mark("react_tool", step=step_index, action=model_step.action)
                 tool_result = self._execute_checked_action(task, state, model_step)
+                _mark("react_tool_done", step=step_index, action=model_step.action, ok=tool_result.ok)
                 if (
                     not tool_result.ok
                     and model_step.action == "run_sql"

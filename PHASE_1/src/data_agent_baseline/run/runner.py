@@ -4,6 +4,7 @@ import csv
 import gc
 import json
 import multiprocessing
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -19,7 +20,12 @@ from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.eval.scoring import column_signature
 from data_agent_baseline.config import AppConfig
+from data_agent_baseline.run.progress import clear_progress, load_progress, mark, reset_progress, snapshot
 from data_agent_baseline.tools.registry import ToolRegistry, create_default_tool_registry
+
+# Warehouse close/delete can block on Windows (DuckDB handle / file lock). Never let
+# cleanup run longer than this, and never block delivering the run result on it.
+_WAREHOUSE_CLEANUP_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +147,7 @@ def _failure_run_result_payload(
     *,
     steps: list[Any] | None = None,
     traceback_text: str | None = None,
+    progress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "task_id": task_id,
@@ -151,7 +158,67 @@ def _failure_run_result_payload(
     }
     if traceback_text:
         payload["traceback"] = traceback_text
+    if progress:
+        payload["progress"] = progress
+        current = progress.get("current")
+        if isinstance(current, dict) and current.get("phase"):
+            payload["hang_at"] = current
     return payload
+
+
+def _attach_progress(run_result: dict[str, Any], progress_path: Path | None) -> dict[str, Any]:
+    progress = snapshot() or load_progress(progress_path)
+    if not progress:
+        return run_result
+    enriched = dict(run_result)
+    enriched["progress"] = progress
+    current = progress.get("current")
+    if isinstance(current, dict) and current.get("phase"):
+        enriched.setdefault("hang_at", current)
+    return enriched
+
+
+def _best_effort_cleanup_tools(
+    tools: Any,
+    *,
+    owns_tools: bool,
+    timeout_seconds: float = _WAREHOUSE_CLEANUP_TIMEOUT_SECONDS,
+) -> None:
+    """Close warehouse files without blocking the task result path.
+
+    DuckDB ``conn.close()`` / Windows file deletes have been observed to hang after
+    a successful answer. Run cleanup on a daemon thread and abandon it on timeout so
+    the worker can still exit and return its result to the parent.
+    """
+    if tools is None and not owns_tools:
+        return
+    mark("cleanup_warehouse")
+    finished = threading.Event()
+
+    def _run() -> None:
+        try:
+            session = getattr(tools, "session", None)
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            if owns_tools:
+                try:
+                    tools_ref = tools
+                    del tools_ref
+                except Exception:
+                    pass
+            gc.collect()
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=_run, name="warehouse-cleanup", daemon=True)
+    thread.start()
+    if finished.wait(timeout_seconds):
+        mark("cleanup_warehouse_done")
+        return
+    mark("cleanup_warehouse_timeout", timeout_seconds=timeout_seconds)
 
 
 def _run_single_task_core(
@@ -160,51 +227,99 @@ def _run_single_task_core(
     config: AppConfig,
     model=None,
     tools: ToolRegistry | None = None,
+    progress_path: Path | None = None,
+    cleanup_box: list[tuple[Any, bool]] | None = None,
 ) -> dict[str, Any]:
-    public_dataset = DABenchPublicDataset(config.dataset.root_path)
-    task = public_dataset.get_task(task_id)
-
-    resolved_model = model or build_model_adapter(config)
-    owns_tools = tools is None
-    resolved_tools = tools or create_default_tool_registry(model=resolved_model)
-    agent = ReActAgent(
-        model=resolved_model,
-        tools=resolved_tools,
-        config=ReActAgentConfig(max_steps=config.agent.max_steps),
-    )
+    if progress_path is not None:
+        reset_progress(progress_path)
+    mark("task_start", task_id=task_id)
+    defer_cleanup = cleanup_box is not None
+    resolved_tools: Any = None
+    owns_tools = False
     try:
-        run_result = agent.run(task)
-        return run_result.to_dict()
+        mark("load_task")
+        public_dataset = DABenchPublicDataset(config.dataset.root_path)
+        task = public_dataset.get_task(task_id)
+
+        mark("build_model")
+        resolved_model = model or build_model_adapter(config)
+        owns_tools = tools is None
+        mark("build_tools")
+        resolved_tools = tools or create_default_tool_registry(model=resolved_model)
+        agent = ReActAgent(
+            model=resolved_model,
+            tools=resolved_tools,
+            config=ReActAgentConfig(max_steps=config.agent.max_steps),
+        )
+        try:
+            mark("agent_run_start")
+            run_result = agent.run(task)
+            mark("agent_run_done", succeeded=bool(run_result.succeeded))
+            return _attach_progress(run_result.to_dict(), progress_path)
+        finally:
+            if defer_cleanup:
+                # Caller delivers the result first, then cleans up.
+                cleanup_box.append((resolved_tools, owns_tools))
+            else:
+                _best_effort_cleanup_tools(resolved_tools, owns_tools=owns_tools)
+                resolved_tools = None
     finally:
-        # Always drop on-disk warehouse (+ WAL/tmp) after the task or retry ends.
-        session = getattr(resolved_tools, "session", None)
-        if session is not None:
-            try:
-                session.close()
-            except Exception:
-                pass
-        if owns_tools:
-            del resolved_tools
-        gc.collect()
+        if not defer_cleanup:
+            clear_progress()
 
 
-def _run_single_task_in_subprocess(task_id: str, config: AppConfig, queue: multiprocessing.Queue[Any]) -> None:
+def _run_single_task_in_subprocess(
+    task_id: str,
+    config: AppConfig,
+    queue: multiprocessing.Queue[Any],
+    progress_path: str | None = None,
+) -> None:
+    path = Path(progress_path) if progress_path else None
+    cleanup_box: list[tuple[Any, bool]] = []
     try:
+        run_result = _run_single_task_core(
+            task_id=task_id,
+            config=config,
+            progress_path=path,
+            cleanup_box=cleanup_box,
+        )
+        # Put the result BEFORE warehouse cleanup. Cleanup has hung on Windows and
+        # previously caused successful tasks to be reported as 300s timeouts.
         queue.put(
             {
                 "ok": True,
-                "run_result": _run_single_task_core(task_id=task_id, config=config),
+                "run_result": run_result,
             }
         )
+        # Critical on Windows: the Queue background feeder otherwise joins at
+        # process exit and deadlocks while the parent is still blocked in
+        # ``process.join()`` and has not yet called ``queue.get()``.
+        try:
+            queue.cancel_join_thread()
+        except Exception:
+            pass
     except BaseException as exc:  # noqa: BLE001
         import traceback
-        queue.put(
-            {
-                "ok": False,
-                "error": _format_exception(exc),
-                "traceback": traceback.format_exc(),
-            }
-        )
+        try:
+            queue.put(
+                {
+                    "ok": False,
+                    "error": _format_exception(exc),
+                    "traceback": traceback.format_exc(),
+                    "progress": load_progress(path),
+                }
+            )
+            try:
+                queue.cancel_join_thread()
+            except Exception:
+                pass
+        except Exception:
+            pass
+    finally:
+        if cleanup_box:
+            tools_obj, owns = cleanup_box[0]
+            _best_effort_cleanup_tools(tools_obj, owns_tools=owns)
+        clear_progress()
 
 
 def _drain_queue(queue: multiprocessing.Queue[Any], *, timeout: float = 5.0) -> Any | None:
@@ -216,6 +331,35 @@ def _drain_queue(queue: multiprocessing.Queue[Any], *, timeout: float = 5.0) -> 
         return queue.get(timeout=timeout)
     except Exception:
         return None
+
+
+def _wait_for_queue_result(
+    process: multiprocessing.Process,
+    queue: multiprocessing.Queue[Any],
+    *,
+    timeout_seconds: float,
+) -> Any | None:
+    """Wait for the child result without requiring the child to exit first.
+
+    Waiting only on ``process.join()`` before ``queue.get()`` deadlocks when the
+    child has already ``put()`` the result: the child's Queue feeder thread will
+    not finish until the parent reads, and the parent will not read until join
+    returns.
+    """
+    deadline = perf_counter() + max(0.1, float(timeout_seconds))
+    while True:
+        remaining = deadline - perf_counter()
+        if remaining <= 0:
+            break
+        try:
+            return queue.get(timeout=min(0.5, remaining))
+        except Exception:
+            if not process.is_alive():
+                # Child exited; do one short final drain for a late put.
+                return _drain_queue(queue, timeout=min(1.0, max(0.1, deadline - perf_counter())))
+    # Timed out waiting for a result. One last non-blocking-ish drain in case the
+    # child put just as we crossed the deadline.
+    return _drain_queue(queue, timeout=0.2)
 
 
 def _cleanup_process_queue(
@@ -234,50 +378,73 @@ def _cleanup_process_queue(
     except Exception:
         pass
     try:
+        queue.cancel_join_thread()
+    except Exception:
+        pass
+    try:
         queue.join_thread()
     except Exception:
         pass
 
 
-def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[str, Any]:
+def _run_single_task_with_timeout(
+    *,
+    task_id: str,
+    config: AppConfig,
+    progress_path: Path | None = None,
+) -> dict[str, Any]:
     timeout_seconds = config.run.task_timeout_seconds
     if timeout_seconds <= 0:
-        return _run_single_task_core(task_id=task_id, config=config)
+        return _run_single_task_core(task_id=task_id, config=config, progress_path=progress_path)
+
+    if progress_path is not None:
+        progress_path.parent.mkdir(parents=True, exist_ok=True)
 
     queue: multiprocessing.Queue[Any] = multiprocessing.Queue()
     process = multiprocessing.Process(
         target=_run_single_task_in_subprocess,
-        args=(task_id, config, queue),
+        args=(task_id, config, queue, str(progress_path) if progress_path else None),
     )
     process.start()
-    process.join(timeout_seconds)
-
-    if process.is_alive():
-        _cleanup_process_queue(process, queue)
-        return _failure_run_result_payload(task_id, f"Task timed out after {timeout_seconds} seconds.")
-
-    # Child exited. Pull the result with a short timeout so a stuck queue feeder
-    # cannot hang the parent forever after the task is already done.
-    result = _drain_queue(queue, timeout=5.0)
+    result = _wait_for_queue_result(process, queue, timeout_seconds=timeout_seconds)
+    progress = load_progress(progress_path)
+    child_alive = process.is_alive()
     _cleanup_process_queue(process, queue)
 
-    if result is None:
-        exit_code = process.exitcode
-        if exit_code not in (None, 0):
+    if isinstance(result, dict) and result.get("ok"):
+        run_result = dict(result["run_result"])
+        if child_alive:
+            # Result arrived, but the worker did not exit promptly (cleanup hang).
+            run_result["cleanup_hung"] = True
+            if progress and "progress" not in run_result:
+                run_result["progress"] = progress
+        return run_result
+
+    if isinstance(result, dict) and result.get("ok") is False:
+        return _failure_run_result_payload(
+            task_id,
+            f"Task failed with uncaught error: {result.get('error') or '<empty error>'}",
+            traceback_text=result.get("traceback") or None,
+            progress=result.get("progress") or progress,
+        )
+
+    exit_code = process.exitcode
+    if child_alive or exit_code not in (None, 0):
+        if child_alive:
             return _failure_run_result_payload(
                 task_id,
-                f"Task exited unexpectedly with exit code {exit_code}.",
+                f"Task timed out after {timeout_seconds} seconds.",
+                progress=progress,
             )
-        return _failure_run_result_payload(task_id, "Task exited without returning a result.")
-
-    if result.get("ok"):
-        return dict(result["run_result"])
-    error_msg = result.get("error") or "<empty error>"
-    traceback_txt = result.get("traceback") or ""
+        return _failure_run_result_payload(
+            task_id,
+            f"Task exited unexpectedly with exit code {exit_code}.",
+            progress=progress,
+        )
     return _failure_run_result_payload(
         task_id,
-        f"Task failed with uncaught error: {error_msg}",
-        traceback_text=traceback_txt or None,
+        "Task exited without returning a result.",
+        progress=progress,
     )
 
 
@@ -313,10 +480,21 @@ def _execute_task_once(
     config: AppConfig,
     model=None,
     tools: ToolRegistry | None = None,
+    progress_path: Path | None = None,
 ) -> dict[str, Any]:
     if model is None and tools is None:
-        return _run_single_task_with_timeout(task_id=task_id, config=config)
-    return _run_single_task_core(task_id=task_id, config=config, model=model, tools=tools)
+        return _run_single_task_with_timeout(
+            task_id=task_id,
+            config=config,
+            progress_path=progress_path,
+        )
+    return _run_single_task_core(
+        task_id=task_id,
+        config=config,
+        model=model,
+        tools=tools,
+        progress_path=progress_path,
+    )
 
 
 def run_single_task(
@@ -331,15 +509,27 @@ def run_single_task(
     import traceback
 
     started_at = perf_counter()
+    task_output_dir = run_output_dir / task_id
+    task_output_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = task_output_dir / "progress.json"
     attempts: list[dict[str, Any]] = []
     try:
-        attempts.append(_execute_task_once(task_id=task_id, config=config, model=model, tools=tools))
+        attempts.append(
+            _execute_task_once(
+                task_id=task_id,
+                config=config,
+                model=model,
+                tools=tools,
+                progress_path=progress_path,
+            )
+        )
     except BaseException as exc:  # noqa: BLE001 — keep the rest of the benchmark running
         attempts.append(
             _failure_run_result_payload(
                 task_id,
                 f"Task failed with uncaught error: {_format_exception(exc)}",
                 traceback_text=traceback.format_exc(),
+                progress=load_progress(progress_path),
             )
         )
 
@@ -347,12 +537,19 @@ def run_single_task(
     while retries_left > 0 and not _has_answer(attempts[-1]):
         retries_left -= 1
         try:
-            retry = _execute_task_once(task_id=task_id, config=config, model=model, tools=tools)
+            retry = _execute_task_once(
+                task_id=task_id,
+                config=config,
+                model=model,
+                tools=tools,
+                progress_path=progress_path,
+            )
         except BaseException as exc:  # noqa: BLE001
             retry = _failure_run_result_payload(
                 task_id,
                 f"Task failed with uncaught error: {_format_exception(exc)}",
                 traceback_text=traceback.format_exc(),
+                progress=load_progress(progress_path),
             )
         retry["empty_retry"] = True
         attempts.append(retry)
@@ -362,6 +559,14 @@ def run_single_task(
         run_result = dict(run_result)
         run_result["attempt_count"] = len(attempts)
         run_result["empty_retry"] = any(item.get("empty_retry") for item in attempts)
+    if "progress" not in run_result:
+        progress = load_progress(progress_path)
+        if progress:
+            run_result = dict(run_result)
+            run_result["progress"] = progress
+            current = progress.get("current")
+            if isinstance(current, dict) and current.get("phase"):
+                run_result.setdefault("hang_at", current)
     run_result["e2e_elapsed_seconds"] = round(perf_counter() - started_at, 3)
     return _write_task_outputs(task_id, run_output_dir, run_result)
 

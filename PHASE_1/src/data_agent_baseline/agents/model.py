@@ -177,9 +177,33 @@ class OpenAIModelAdapter:
             create_kwargs["extra_body"] = extra
 
         try:
+            from data_agent_baseline.run.progress import mark as _mark
+
+            _mark(
+                "llm_request_start",
+                provider=self.provider,
+                model=self.model,
+                timeout=self.request_timeout,
+                max_retries=self.max_retries,
+                message_count=len(messages),
+            )
             response = client.chat.completions.create(**create_kwargs)
+            _mark("llm_request_done", provider=self.provider, model=self.model)
         except APIError as exc:
+            from data_agent_baseline.run.progress import mark as _mark
+
+            _mark("llm_request_failed", provider=self.provider, error=str(exc)[:300])
             raise RuntimeError(f"Model request failed: {exc}") from exc
+        except Exception as exc:
+            from data_agent_baseline.run.progress import mark as _mark
+
+            _mark(
+                "llm_request_failed",
+                provider=self.provider,
+                error_type=type(exc).__name__,
+                error=str(exc)[:300] or type(exc).__name__,
+            )
+            raise
 
         choices = response.choices or []
         if not choices:

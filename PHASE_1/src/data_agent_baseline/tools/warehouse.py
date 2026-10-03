@@ -1,9 +1,9 @@
-"""Per-task on-disk DuckDB warehouse: CSV / JSON / SQLite → tables.
+"""Per-task in-memory DuckDB warehouse: CSV / JSON / SQLite → tables.
 
-Official SQLite lives under ``context/db/*.db``. The agent warehouse is a separate
-file ``context/db/warehouse.duckdb`` so large tables spill to disk instead of
-holding everything in RAM. The warehouse file (and its temp dir) is deleted on
-every rebuild and on close, so each run/retry starts clean.
+Official SQLite lives under ``context/db/*.db``. The agent warehouse is an
+in-memory DuckDB (``:memory:``) with ``memory_limit`` + ``temp_directory`` so
+large joins/aggregations spill into ``context/db/warehouse_tmp`` instead of
+OOM'ing. Legacy on-disk ``warehouse.duckdb`` leftovers are deleted on open/close.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import gc
 import json
 import math
+import os
 import re
 import shutil
 import sqlite3
@@ -39,9 +40,14 @@ _FILE_FN_RE = re.compile(
 )
 
 # Agent-owned DuckDB artifacts under context/db/; never ingest these as source tables.
-WAREHOUSE_DB_NAME = "warehouse.duckdb"
+WAREHOUSE_DB_NAME = "warehouse.duckdb"  # legacy filename; no longer the live database
 WAREHOUSE_TMP_DIRNAME = "warehouse_tmp"
-WAREHOUSE_MEMORY_LIMIT = "2GB"
+WAREHOUSE_MEMORY_LIMIT = (
+    os.environ.get("DATA_AGENT_WAREHOUSE_MEMORY", "2GB") or "2GB"
+).strip()
+WAREHOUSE_MAX_TEMP_SIZE = (
+    os.environ.get("DATA_AGENT_WAREHOUSE_MAX_TEMP", "50GB") or "50GB"
+).strip()
 _SKIP_NAMES = {
     WAREHOUSE_DB_NAME,
     f"{WAREHOUSE_DB_NAME}.wal",
@@ -119,7 +125,11 @@ def warehouse_tmp_dir(context_dir: Path) -> Path:
 
 
 def clear_warehouse_files(context_dir: Path) -> None:
-    """Delete on-disk warehouse DB, WAL, and temp dir. Safe to call repeatedly."""
+    """Delete legacy on-disk warehouse DB/WAL and the spill temp dir.
+
+    Safe to call repeatedly. Does not touch official ``*.db`` sources or extract
+    caches under ``db/extract/``.
+    """
     db_path = warehouse_db_path(context_dir)
     candidates = [
         db_path,
@@ -201,15 +211,22 @@ class WarehouseState:
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def close(self) -> None:
+        # Close the in-memory connection, then drop spill/legacy files. Either step
+        # can hang on Windows; callers should wrap with a timeout (see runner).
         with self._lock:
+            conn = self.conn
             try:
-                self.conn.close()
+                conn.close()
             except Exception:
                 pass
-        # Drop the on-disk file after the connection is closed so the next
-        # run/retry does not inherit a stale or partially-written warehouse.
-        clear_warehouse_files(self.context_dir)
-        gc.collect()
+        try:
+            clear_warehouse_files(self.context_dir)
+        except Exception:
+            pass
+        try:
+            gc.collect()
+        except Exception:
+            pass
 
 
 def _used_names(state: WarehouseState) -> set[str]:
@@ -459,15 +476,17 @@ def _collect_files(context_dir: Path, pattern: str) -> list[Path]:
     return found
 
 
-def _open_warehouse_connection(context_dir: Path) -> tuple[duckdb.DuckDBPyConnection, Path]:
-    """Open a fresh on-disk DuckDB, clearing any previous warehouse files first."""
+def _open_warehouse_connection(
+    context_dir: Path,
+) -> tuple[duckdb.DuckDBPyConnection, Path | None]:
+    """Open an in-memory DuckDB that spills to ``warehouse_tmp`` under memory pressure."""
     clear_warehouse_files(context_dir)
-    db_path = warehouse_db_path(context_dir)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_dir = context_dir / "db"
+    db_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir = warehouse_tmp_dir(context_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    conn = duckdb.connect(str(db_path))
+    conn = duckdb.connect(":memory:")
     # Cap RAM so large CREATE TABLE / joins spill into warehouse_tmp instead of OOM.
     try:
         conn.execute(f"SET memory_limit='{WAREHOUSE_MEMORY_LIMIT}'")
@@ -477,7 +496,11 @@ def _open_warehouse_connection(context_dir: Path) -> tuple[duckdb.DuckDBPyConnec
         conn.execute(f"SET temp_directory={duckdb_path_literal(tmp_dir)}")
     except Exception:
         pass
-    return conn, db_path
+    try:
+        conn.execute(f"SET max_temp_directory_size='{WAREHOUSE_MAX_TEMP_SIZE}'")
+    except Exception:
+        pass
+    return conn, None
 
 
 def build_warehouse(
@@ -486,44 +509,77 @@ def build_warehouse(
     model: Any | None = None,
     force_rebuild: bool = True,
 ) -> WarehouseState:
-    """Scan one task's context/ into a fresh on-disk DuckDB warehouse.
+    """Scan one task's context/ into a fresh in-memory DuckDB warehouse.
 
-    Always clears ``context/db/warehouse.duckdb`` (+ WAL/tmp) before opening so
-    each run and each retry starts from an empty file.
+    Clears legacy ``warehouse.duckdb`` leftovers and ``warehouse_tmp`` before
+    opening so each run/retry starts clean. Spill files live only under
+    ``warehouse_tmp`` while the connection is open.
     """
+    from data_agent_baseline.run.progress import mark as _mark
+
     del force_rebuild  # rebuild is always fresh; kept for call-site compatibility
     if not context_dir.is_dir():
         conn = duckdb.connect(":memory:")
         return WarehouseState(conn=conn, context_dir=context_dir, db_path=None)
 
+    _mark(
+        "warehouse_open",
+        context=str(context_dir),
+        mode="memory",
+        memory_limit=WAREHOUSE_MEMORY_LIMIT,
+    )
     conn, db_path = _open_warehouse_connection(context_dir)
     state = WarehouseState(conn=conn, context_dir=context_dir, db_path=db_path)
+    _mark(
+        "warehouse_opened",
+        mode="memory",
+        temp_dir=str(warehouse_tmp_dir(context_dir)),
+        memory_limit=WAREHOUSE_MEMORY_LIMIT,
+    )
 
-    for path in _collect_files(context_dir, "*.csv"):
+    csv_paths = _collect_files(context_dir, "*.csv")
+    for path in csv_paths:
         try:
+            _mark("warehouse_register_csv", file=path.name, bytes=path.stat().st_size)
             _register_csv(state, path)
         except Exception:
             # Match json/sqlite: one bad/huge CSV must not abort the whole warehouse.
             continue
-    for path in _collect_files(context_dir, "*.json"):
+    json_paths = _collect_files(context_dir, "*.json")
+    for path in json_paths:
         try:
+            _mark("warehouse_register_json", file=path.name, bytes=path.stat().st_size)
             _register_json(state, path)
         except Exception:
             continue
-    for path in _collect_files(context_dir, "*.db") + _collect_files(context_dir, "*.sqlite"):
+    sqlite_paths = _collect_files(context_dir, "*.db") + _collect_files(context_dir, "*.sqlite")
+    for path in sqlite_paths:
         try:
+            _mark("warehouse_register_sqlite", file=path.name, bytes=path.stat().st_size)
             _register_sqlite(state, path)
         except Exception:
             continue
     try:
-        from data_agent_baseline.tools.doc_extract import extract_all_documents
+        from data_agent_baseline.tools.doc_extract import (
+            ExtractionBudget,
+            extract_all_documents,
+        )
 
-        for extracted in extract_all_documents(context_dir, model):
+        _mark("warehouse_extract_docs")
+        extract_budget = ExtractionBudget.from_env()
+        for extracted in extract_all_documents(
+            context_dir, model, budget=extract_budget
+        ):
             _register_extracted(state, extracted)
-    except Exception:
-        pass
+        _mark(
+            "warehouse_extract_docs_done",
+            budget_remaining=round(extract_budget.remaining, 1),
+        )
+    except Exception as exc:
+        _mark("warehouse_extract_docs_failed", error=str(exc)[:300])
     # Encourage releasing peak Python allocations from pandas/json loads.
     gc.collect()
+    _mark("warehouse_ready", table_count=len(state.tables))
     return state
 
 
@@ -669,7 +725,7 @@ def execute_sql(
 
 @dataclass
 class WarehouseSession:
-    """One on-disk DuckDB per task. Rebuilds (and clears the file) when task_id changes."""
+    """One in-memory DuckDB per task (disk spill under memory pressure)."""
 
     model: Any | None = None
     task_id: str | None = None
