@@ -44,3 +44,7 @@ PHASE_1/configs/
 # OS / notebook noise
 .DS_Store
 .ipynb_checkpoints/
+
+# Local Cursor memory (not for the repo)
+USER.md
+memory.md
