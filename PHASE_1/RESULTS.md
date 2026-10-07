@@ -10,26 +10,51 @@ Scoring: `score = max(0, recall − λ · extra_cols / pred_cols)`; missing
 
 ## Summary (50-task runs)
 
-| Run ID | Mean | Predictions | Mean@pred | Missing | Workers | Notes |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `20260930T065125Z` | **0.8245** | 49 | 0.8413 | 1 | 1 | §13 五手段首轮；199/243 修复确认；180/249 为 SQL authoring 方差回退（非门禁误伤） |
-| `20260930T034747Z` | 0.8133 | 47 | 0.8652 | 3 | 1 | 25/199/243 回退；触发 §13 架构级优化 |
-| `20260929T103145Z` | 0.7933 | 45 | 0.8814 | 5 | 1 | recoveries on 173/196/199/249/250/180 |
-| `20260929T092951Z` | 0.6832 | 41 | 0.8331 | 9 | 1 | Extract cache A/B/C/D; warehouse timeouts ↓ |
-| `20260929T072431Z` | 0.5935 | 37 | 0.8021 | 13 | 1 | `_EXTRACT_VERSION=4` cache bust → 429 / timeouts |
-| `20260929T055612Z` | 0.5955 | 38 | 0.7836 | 12 | 1 | Mid-iteration gates / prompts |
-| `20260929T021745Z` | 0.6947 | 43 | 0.8078 | 7 | 1 | Pre–version-bump baseline of the day |
-| `20260928T092609Z` | 0.7337 | 46 | 0.7975 | 4 | 1 | Stable mid-week run |
-| `20260924T095853Z` | 0.7570 | 46 | 0.8228 | 4 | 1 | Strong early full-set reference |
-| `20260923T011119Z` | 0.5867 | 45 | 0.6519 | 5 | 8 | Early parallel; lower quality |
-| `20260922T083552Z` | 0.7577 | 46 | 0.8236 | 4 | 8 | Early full-set |
-| `20260922T012037Z` | 0.7240 | 47 | 0.7702 | 3 | 8 | Early full-set |
+| Run ID | Mean | Predictions | Mean@pred | Missing | Workers | Model | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| `20261006T035536Z` | **0.8193** | 50 | 0.8193 | 0 | 1 | Qwen3.6-35B (local) | Best local OSS full run after vLLM HTTP fix |
+| `20261006T022037Z` | 0.7940 | 50 | 0.7940 | 0 | 1 | Qwen3.6-35B (local) | First full Qwen suite (0 missing) |
+| `20261006T032915Z` | 0.7483 | 49 | 0.7636 | 1 | 1 | Qwen3.6-35B (local) | Mid jitter |
+| `20261005T084204Z` | 0.8364 | 49 | 0.8535 | 1 | 1 | MiniMax-M2.5 | After rolling back over-strict COUNT/HAVING |
+| `20261005T071531Z` | 0.7965 | 47 | 0.8473 | 3 | 1 | MiniMax-M2.5 | Mid recovery |
+| `20261005T022131Z` | 0.7763 | 48 | 0.8087 | 2 | 1 | MiniMax-M2.5 | Over-strict gates + connection errors |
+| `20261004T184309Z` | 0.8353 | 46 | 0.9080 | 4 | 1 | MiniMax-M2.5 | — |
+| `20261004T181023Z` | **0.8538** | 49 | 0.8713 | 1 | 1 | MiniMax-M2.5 | **Best overall** (P0/P1 era) |
+| `20261004T155219Z` | 0.8365 | 49 | 0.8536 | 1 | 1 | MiniMax-M2.5 | P0/P1 first full score |
+| `20261004T022019Z` | 0.8324 | 50 | 0.8324 | 0 | 1 | MiniMax-M2.5 | TaskBudget: first 0-missing |
+| `20261003T171818Z` | 0.8330 | 49 | 0.8500 | 1 | 1 | MiniMax-M2.5 | Episode + budget landed |
+| `20261003T154638Z` | 0.6952 | 38 | 0.9148 | 12 | 1 | MiniMax-M2.5 | Doc missing still high |
+| `20261003T064727Z` | 0.7547 | 43 | 0.8775 | 7 | 1 | MiniMax-M2.5 | Motivated §14 budgets |
+| `20261003T041502Z` | 0.6521 | 41 | 0.7953 | 9 | 1 | MiniMax-M2.5 | — |
+| `20261003T014637Z` | 0.6560 | 41 | 0.8000 | 9 | 1 | MiniMax-M2.5 | — |
+| `20261002T223024Z` | 0.6349 | 39 | 0.8139 | 11 | 1 | MiniMax-M2.5 | MiniMax switch-in |
+| `20260930T065125Z` | **0.8245** | 49 | 0.8413 | 1 | 1 | DeepSeek-family | §13 five means; 199/243 fixed; 180/249 SQL variance |
+| `20260930T034747Z` | 0.8133 | 47 | 0.8652 | 3 | 1 | DeepSeek-family | 25/199/243 regression; triggered §13 |
+| `20260929T103145Z` | 0.7933 | 45 | 0.8814 | 5 | 1 | DeepSeek-family | recoveries on 173/196/199/249/250/180 |
+| `20260929T092951Z` | 0.6832 | 41 | 0.8331 | 9 | 1 | DeepSeek-family | Extract cache A/B/C/D; warehouse timeouts ↓ |
+| `20260929T072431Z` | 0.5935 | 37 | 0.8021 | 13 | 1 | DeepSeek-family | `_EXTRACT_VERSION=4` cache bust → 429 / timeouts |
+| `20260929T055612Z` | 0.5955 | 38 | 0.7836 | 12 | 1 | DeepSeek-family | Mid-iteration gates / prompts |
+| `20260929T021745Z` | 0.6947 | 43 | 0.8078 | 7 | 1 | DeepSeek-family | Pre–version-bump baseline of the day |
+| `20260928T092609Z` | 0.7337 | 46 | 0.7975 | 4 | 1 | DeepSeek-family | Stable mid-week run |
+| `20260924T095853Z` | 0.7570 | 46 | 0.8228 | 4 | 1 | DeepSeek-family | Strong early full-set reference |
+| `20260923T011119Z` | 0.5867 | 45 | 0.6519 | 5 | 8 | DeepSeek-family | Early parallel; lower quality |
+| `20260922T083552Z` | 0.7577 | 46 | 0.8236 | 4 | 8 | DeepSeek-family | Early full-set |
+| `20260922T012037Z` | 0.7240 | 47 | 0.7702 | 3 | 8 | DeepSeek-family | Early full-set |
 
 Single-task smoke runs (`mean=1.0`, 1 prediction) are omitted from the table.
 
 ---
 
-## Latest run (`20260930T065125Z`)
+## Latest highlighted runs
+
+| Metric | MiniMax best `181023Z` | Qwen best `035536Z` |
+| --- | ---: | ---: |
+| Mean score | **0.8538** | **0.8193** |
+| Predictions | 49 / 50 | 50 / 50 |
+| Mean@pred | 0.8713 | 0.8193 |
+| Missing | `task_418` | — |
+
+### DeepSeek-era reference (`20260930T065125Z`)
 
 | Metric | Value |
 | --- | --- |
@@ -76,6 +101,16 @@ No gate misfire caused a regression; both regressions are run-to-run SQL authori
 ## Code changelog (mechanism-level)
 
 Changes are ordered newest-first. Paths are under `src/data_agent_baseline/`.
+
+### 2026-10 — TaskBudget / P0–P1 / local Qwen
+
+| ID | Change | Score effect |
+| --- | --- | --- |
+| §14 | `TaskBudget` + `EpisodeState` (tiered wall-clock, plan/ban/PROGRESS) | MiniMax missing 11→1; mean ~0.63→0.83 |
+| P0 | Cutoff / fake-zero / scalar promote (`answer_contract`, `submit_rows`) | Peak **0.8538** on MiniMax |
+| P1 | Execution-cluster vote + sidecar column drop | Extra-col λ penalty ↓ on several tasks |
+| Local | `provider=local`; IPv4 + no-keepalive httpx; disable Qwen thinking | Qwen full runs **0.79–0.82** (was empty 502) |
+| Rollback | Dropped over-strict unique undirected COUNT / HAVING-IN dump gate | Recovered MiniMax ~0.78→0.84 |
 
 ### 2026-09-30 — §13 architecture means (IR / grain contract / roles / arbitration / tri-state)
 

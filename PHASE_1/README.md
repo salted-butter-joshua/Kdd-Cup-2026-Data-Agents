@@ -8,138 +8,182 @@ English | [中文](README.zh.md)
 [![Demo Dataset](https://img.shields.io/badge/Demo%20Dataset-Download%20Phase%201-f59e0b?style=for-the-badge&logo=googledrive&logoColor=white&labelColor=0f172a)](https://drive.google.com/file/d/1c6u5WlFw4KV7CBRyXh5BvFYbKqxhBSbL/view)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white&labelColor=0f172a)](https://discord.com/invite/7eFwJQN3Fx)
 
+**KDD Cup 2026 · DataAgent-Bench · Phase 1**
+
+A hardened ReAct data agent: per-task DuckDB warehouse, deterministic L3 submit gates, tiered wall-clock budgets. Works with MiniMax, DeepSeek, Zhipu, and local Qwen via any OpenAI-compatible `/v1` server.
+
 </div>
 
-> Official starter kit for the KDD Cup 2026 DataAgent-Bench challenge. The repository reads tasks from `data/public/input/` and writes predictions for downstream evaluation.
+> Default I/O: read `data/public/input/`, write `prediction.csv` for the official column-signature metric (`λ=0.1`).  
+> Mechanisms: [架构设计.md](架构设计.md) (Chinese). Full score history: [RESULTS.md](RESULTS.md).
 
-## Overview
+---
+
+## Highlights
 
 | Item | Value |
 | --- | --- |
-| Dataset input | `data/public/input/` |
-| Public demo ground truth | `data/public/output/task_<id>/gold.csv` |
-| Hidden test data | `input/` only, no `output/` |
-| Entry command | `uv run dabench <command> --config PATH` |
-| Default run output | `artifacts/runs/` |
-| Latest 50-task mean | **0.7933** (run `20260929T103145Z`) |
-| Score history / changelog | [RESULTS.md](RESULTS.md) |
-| Architecture notes | [架构设计.md](架构设计.md) (Chinese) |
+| Public demo | **50** tasks |
+| Best mean (this fork) | **0.8538** · MiniMax-M2.5 · `20261004T181023Z` |
+| Best local OSS model | **0.8193** · Qwen3.6-35B-A3B-FP8 · `20261006T035536Z` |
+| Submission rate (best) | MiniMax **49/50**; Qwen **50/50** |
+| Entry | `uv run dabench <command> --config PATH` |
+| Artifacts | `artifacts/runs/<run_id>/` |
+
+<p align="center">
+  <img src="assets/score_evolution.png" alt="Public 50-task mean_score by architecture stage" width="920" />
+</p>
+
+(Representative full runs; exact run IDs / models in the tables below. Regenerate with `python assets/gen_readme_figures.py`.)
+
+---
+
+## Architecture
+
+The agent does **not** answer by reading raw files. Flow: **build warehouse → ReAct SQL probes → deterministic gates → submit**.
+
+<p align="center">
+  <img src="assets/architecture_layers.png" alt="Data Agent layered architecture with legend" width="960" />
+</p>
+
+| Layer | Role | Modules |
+| --- | --- | --- |
+| **L0** | Structured tables + doc extract (complete-or-nothing cache) | `tools/warehouse.py`, `doc_extract.py` |
+| **L-1** | Tiered wall-clock, extract/solve reserve, episode blackboard | `run/task_budget.py`, `agents/episode.py` |
+| **L2** | JSON ReAct; tools hit the warehouse only | `agents/react.py`, `tools/registry.py` |
+| **L3** | Code-only gates; undecidable → pass | `submit_*`, `grain_contract`, `answer_contract` |
+| **L4/L5** | Repair escalation; exhaust vote / fallback submit | `react.py`, `voting.py` |
+| **L6** | Official column-signature score | `eval/scoring.py` |
+
+Discipline: **mechanism-level rules, no `task_id` special cases; never submit empty CSV; fail-open when evidence is missing.**
+
+---
 
 ## Benchmark Results
 
-Recent **50-task** public-demo runs (official column-signature metric, `λ=0.1`):
+Metric: public demo **50 tasks**, `score = max(0, recall − 0.1 × extra_cols / pred_cols)`. Missing `prediction.csv` → **0**, still averaged.
 
-| Run ID | Mean | With pred. | Mean@pred | Missing |
-| --- | ---: | ---: | ---: | ---: |
-| `20260929T103145Z` | **0.7933** | 45 | 0.8814 | 5 |
-| `20260929T092951Z` | 0.6832 | 41 | 0.8331 | 9 |
-| `20260929T072431Z` | 0.5935 | 37 | 0.8021 | 13 |
-| `20260924T095853Z` | 0.7570 | 46 | 0.8228 | 4 |
+### Representative full runs
 
-Full curve, per-task failure notes, and mechanism changelog: **[RESULTS.md](RESULTS.md)**.
+| Stage | Run ID | Model | Mean | With pred. | Missing | Notes |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| Early parallel | `20260923T011119Z` | DeepSeek-family | 0.5867 | 45 | 5 | `workers=8`, unstable |
+| §13 gate peak | `20260930T065125Z` | DeepSeek-family | 0.8245 | 49 | 1 | IR / grain / tri-state |
+| MiniMax early | `20261002T223024Z` | **MiniMax-M2.5** | 0.6349 | 39 | 11 | Many doc-task missings |
+| + TaskBudget / Episode | `20261003T171818Z` | MiniMax-M2.5 | 0.8330 | 49 | 1 | Missing **11→1** |
+| Full-submit baseline | `20261004T022019Z` | MiniMax-M2.5 | 0.8324 | **50** | **0** | First 0-missing after budgets |
+| **P0/P1 peak** | `20261004T181023Z` | MiniMax-M2.5 | **0.8538** | 49 | 1 | Cutoff / fake-zero / vote / projection |
+| Over-strict gates | `20261005T022131Z` | MiniMax-M2.5 | 0.7763 | 48 | 2 | Gate + API jitter |
+| After rollback | `20261005T084204Z` | MiniMax-M2.5 | 0.8364 | 49 | 1 | Rolled back over-strict COUNT/HAVING |
+| Qwen first full | `20261006T022037Z` | **Qwen3.6-35B** | 0.7940 | **50** | **0** | Fixed empty vLLM 502 |
+| **Qwen best** | `20261006T035536Z` | Qwen3.6-35B | **0.8193** | **50** | **0** | Local FP8 OSS model |
+
+### Architecture change → score impact
+
+<p align="center">
+  <img src="assets/impact_map.png" alt="Architecture changes vs score impact" width="900" />
+</p>
+
+| Change set | Problem addressed | Measured impact |
+| --- | --- | --- |
+| **L3 base gates** | “Runs → submit” semantic errors | DeepSeek full runs ~0.59 → **0.82** (`065125Z`) |
+| **Extract cache + rate limits** | 429 / warehouse timeouts / missing spike | Bad cache bump → **0.59** (`072431Z`); warm restores |
+| **§14 TaskBudget + Episode** | Doc extract eats wall-clock; empty warehouse thrash | MiniMax missing **11→1**, mean **0.63→0.83** |
+| **P0 cutoff / fake-zero / scalar promote** | LIMIT-1 collapse, constant 0, bad promote | Peak **0.8538** (`181023Z`) |
+| **P1 voting + sidecar drop** | Wrong exhaust promote; λ extra-col penalty | Same era as P0 |
+| **Over-strict undirected COUNT / HAVING-IN** | Stabilize 196/199 | With API jitter → **0.776**; after rollback → **0.836** |
+| **Local provider + IPv4 / no-keepalive** | OpenAI SDK → vLLM empty 502 | Qwen from all-zero runs to full **0.79–0.82** |
+
+### Model comparison: MiniMax vs Qwen3.6
+
+<p align="center">
+  <img src="assets/model_comparison.png" alt="MiniMax vs Qwen3.6 on the same agent stack" width="720" />
+</p>
+
+| | **MiniMax-M2.5** | **Qwen3.6-35B-A3B-FP8** (local vLLM) |
+| --- | --- | --- |
+| Best mean | **0.8538** (`181023Z`) | **0.8193** (`035536Z`) |
+| Submissions | Usually 49–50 / 50 | Stable **50 / 50** after adapter fix |
+| Strengths | Stronger on hard grain/ratio; higher peak | Self-hosted, no token bill, complete submits |
+| Risks | API jitter burns steps | Thinking in `content` / HTTP 502 (mitigated in `model.py`) |
+| Config | `provider: minimax` | `provider: local` + `api_base: http://host:port/v1` |
+
+**Shared residual zeros:** `163` (wrong type column), `169` (SUM/12 vs AVG/12; knowledge vs gold), `344/352/396` (sparse docs / extract). Gates **do not adjudicate** knowledge vs gold.
+
+---
 
 ## Quick Start
 
-1. Install `uv` by following the official guide:
-   - https://docs.astral.sh/uv/getting-started/installation/
-2. On macOS and Linux, the standalone installer is:
+1. Install [`uv`](https://docs.astral.sh/uv/getting-started/installation/):
 
    ```bash
    curl -LsSf https://astral.sh/uv/install.sh | sh
    ```
 
-3. Install project dependencies:
+2. From `PHASE_1/`:
 
    ```bash
    uv sync
    ```
 
-4. Confirm the dataset root is visible:
+3. Place the public demo under `data/public/input/` (gold under `data/public/output/`).
 
-   ```bash
-   uv run dabench status --config configs/react_baseline.example.yaml
-   ```
-
-5. Copy the example config and fill in credentials (local configs are gitignored):
+4. Copy config and set the model:
 
    ```bash
    cp configs/react_baseline.example.yaml configs/react_baseline.yaml
    ```
 
-6. (Recommended) Warm document-extract caches before scoring to avoid 429 / warehouse timeouts:
+5. (Recommended) warm extract caches:
 
    ```bash
    uv run dabench warm-extract-cache --config configs/react_baseline.yaml
    ```
 
-7. Run the baseline:
+6. Run & score:
 
    ```bash
    uv run dabench run-benchmark --config configs/react_baseline.yaml
+   uv run dabench score artifacts/runs/<run_id> --config configs/react_baseline.yaml
    ```
 
-## Dataset
-
-The public demo dataset lives under `data/public/input/`. Each task directory follows this structure:
-
-```text
-data/public/input/task_<id>/
-├── task.json
-└── context/
-```
-
-The corresponding public demo answers live separately under `data/public/output/task_<id>/gold.csv`.
-Hidden test sets only include `input/`, so there is no `output/` directory there.
-
-`task.json` contains:
-
-- `task_id`
-- `difficulty`
-- `question`
-
-The `context/` directory may contain one or more of:
-
-- CSV files
-- JSON files
-- SQLite / DB files
-- Text documents
+---
 
 ## Configuration
 
-An example config file lives at `configs/react_baseline.example.yaml`.
+Example: `configs/react_baseline.example.yaml` (local `react_baseline.yaml` is gitignored).
 
 ```yaml
 dataset:
   root_path: data/public/input
 
 agent:
-  model: YOUR_MODEL_NAME
-  api_base: YOUR_API_BASE_URL
-  api_key: YOUR_API_KEY
+  provider: local                 # deepseek | minimax | zhipu | openai | local
+  model: Qwen3.6-35B-A3B-FP8
+  api_base: http://10.x.x.x:8090/v1   # stop at /v1; do not append /chat/completions
+  api_key:                        # optional for local
   max_steps: 16
   temperature: 0.0
+  strip_think: true
 
 run:
   output_dir: artifacts/runs
-  run_id:
-  max_workers: 4
-  task_timeout_seconds: 600
+  max_workers: 1
+  task_timeout_seconds: 0         # 0 = Easy/Med/Hard tiered budgets
+
+eval:
+  enabled: true
+  lambda_extra: 0.1
 ```
 
-Config fields:
+| provider | Default `api_base` | Notes |
+| --- | --- | --- |
+| `deepseek` | `https://api.deepseek.com/v1` | Strip `<think>` |
+| `minimax` | `https://api.minimax.io/v1` | `reasoning_split` |
+| `zhipu` | `https://open.bigmodel.cn/api/paas/v4` | Thinking off by default |
+| `local` | `http://localhost:8090/v1` | vLLM/SGLang; IPv4 + no keepalive; disable `enable_thinking` |
 
-| Field | Meaning |
-| --- | --- |
-| `dataset.root_path` | Root directory of the public demo `input/` dataset. Relative paths are resolved from the project root. |
-| `agent.model` | Model name. |
-| `agent.api_base` | OpenAI-compatible API base URL. |
-| `agent.api_key` | API key, read directly from the config file. |
-| `agent.max_steps` | Maximum ReAct steps per task. |
-| `agent.temperature` | Sampling temperature. |
-| `run.output_dir` | Output directory for run artifacts. |
-| `run.run_id` | Optional run directory name. Defaults to a UTC timestamp if omitted. Must be a single directory name; existing run directories are rejected. |
-| `run.max_workers` | Parallel worker count for `run-benchmark`. |
-| `run.task_timeout_seconds` | Maximum wall-clock time per task. Set to `0` or a negative value to disable the task-level timeout. |
+---
 
 ## CLI
 
@@ -147,118 +191,97 @@ Config fields:
 uv run dabench <command> --config PATH [options]
 ```
 
-| Command | Purpose | Example |
-| --- | --- | --- |
-| `status` | Show project paths, config path, dataset root, and public task counts. | `uv run dabench status --config configs/react_baseline.example.yaml` |
-| `inspect-task` | Show task metadata and list accessible files under `context/`. | `uv run dabench inspect-task task_11 --config configs/react_baseline.yaml` |
-| `warm-extract-cache` | Serially warm document extract caches (rate-limit friendly; run before scoring). | `uv run dabench warm-extract-cache --config configs/react_baseline.yaml` |
-| `run-task` | Run the baseline on one task and write outputs. | `uv run dabench run-task task_11 --config configs/react_baseline.yaml` |
-| `run-benchmark` | Run the baseline across the public dataset. | `uv run dabench run-benchmark --config configs/react_baseline.yaml` |
-| `score` | Score an existing run directory. | `uv run dabench score artifacts/runs/<run_id> --config configs/react_baseline.yaml` |
+| Command | Purpose |
+| --- | --- |
+| `status` | Paths / dataset visibility |
+| `inspect-task` | Task metadata + context tree |
+| `warm-extract-cache` | Serial extract warm-up |
+| `run-task` | Single task |
+| `run-benchmark` | Full suite (`--limit N` optional) |
+| `score` | Score an existing run |
 
-`run-benchmark` / `warm-extract-cache` also support `--limit N`.
+---
 
 ## Tools
 
-ReAct tools operate on a **per-task DuckDB warehouse** (not raw context files):
+Operate on the **per-task DuckDB warehouse**:
 
-| Tool | Purpose | Inputs |
-| --- | --- | --- |
-| `list_tables` | List tables, columns, and row counts in the task warehouse. | (none) |
-| `run_sql` | Read-only SQL; `final=false` probes, `final=true` stores the answer table. | `sql`, `final`, optional `grain` |
-| `answer` | Submit the last `final=true` result and end the task. | `{}` |
+| Tool | Purpose |
+| --- | --- |
+| `list_tables` | Tables / columns / row counts |
+| `run_sql` | Read-only SQL; `final=false` probe, `final=true` answer table |
+| `search_docs` | Search `doc/*.md` (not `knowledge.md`) |
+| `answer` | Submit last `final=true` result and stop |
 
-SQL is parse/`EXPLAIN`-checked before execution; submit-time gates cover empty results, ties, grain, relation DISTINCT, shape, and ID-column suppression. See [架构设计.md](架构设计.md).
+Parse / `EXPLAIN` before execute; L3 gates before accept. See [架构设计.md](架构设计.md).
+
+---
 
 ## Outputs
-
-Each successful task run may produce:
-
-- `trace.json`
-- `prediction.csv`
-
-Per-task outputs are written to:
-
-```text
-artifacts/runs/<run_id>/<task_id>/
-├── trace.json
-└── prediction.csv
-```
-
-Benchmark runs also write:
 
 ```text
 artifacts/runs/<run_id>/
 ├── summary.json
-├── scores_summary.json   # after dabench score
-└── task_*/…
+├── scores.csv / scores_summary.json
+└── task_<id>/
+    ├── trace.json
+    ├── prediction.csv      # may be missing → score 0
+    └── progress.json
 ```
 
-## Notable changes (summary)
+---
 
-| Theme | What changed |
+## Project Layout
+
+| Path | Responsibility |
 | --- | --- |
-| Extract cache | Versioned caches; ≥v1 deterministic upgrade; `warm-extract-cache` |
-| Rate limits | Serial paced extract; hard LLM timeout/retries; 429 hard-stop |
-| Submit gates | Empty / tie / grain / relation DISTINCT / scalar shape / ID suppress |
-| Fallback submit | Auto-submit last `final=true` through gates when max_steps is hit |
+| `agents/react.py` | ReAct loop + gate orchestration |
+| `agents/model.py` | OpenAI-compatible adapter (incl. local/vLLM) |
+| `agents/answer_contract.py` | Cutoff / fake-zero / sidecars |
+| `agents/grain_contract.py` | Unified grain contract |
+| `run/task_budget.py` | Tiered wall-clock |
+| `run/runner.py` | Single / batch runner |
+| `tools/warehouse.py` | DuckDB build |
+| `tools/doc_extract.py` | Doc extract + cache |
+| `eval/scoring.py` | Official scorer |
 
-Full metric history and changelog: [RESULTS.md](RESULTS.md).
+---
+
+## Docs
+
+| Doc | Content |
+| --- | --- |
+| [架构设计.md](架构设计.md) | L0–L6, §13 gates, §14 budgets, P0–P2 |
+| [RESULTS.md](RESULTS.md) | Historical runs + changelog |
+| [运行说明.md](运行说明.md) | Windows / PowerShell ops (Chinese) |
+| [测试文档.md](测试文档.md) | Early DeepSeek round notes (Chinese) |
+
+---
 
 ## Contact
 
-- Open issues: https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit/issues
-- Official website: https://dataagent.top
-- Discord: https://discord.com/invite/7eFwJQN3Fx
-- WeChat official account: `数据智能与分析实验室 DIAL`
+- Issues: https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit/issues  
+- Website: https://dataagent.top  
+- Discord: https://discord.com/invite/7eFwJQN3Fx  
+- WeChat: `数据智能与分析实验室 DIAL`
 
 <div align="center">
   <table>
     <tr>
       <td align="center">
         <a href="https://dataagent.top">
-          <img
-            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://dataagent.top&bgcolor=ffffff&color=111827&margin=8"
-            alt="Official website QR code"
-            width="144"
-          />
-        </a>
-        <br />
-        Official Website
+          <img src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://dataagent.top&bgcolor=ffffff&color=111827&margin=8" alt="Official website QR" width="144" />
+        </a><br />Official Website
       </td>
       <td align="center">
         <a href="https://discord.com/invite/7eFwJQN3Fx">
-          <img
-            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://discord.com/invite/7eFwJQN3Fx&bgcolor=ffffff&color=111827&margin=8"
-            alt="Discord QR code"
-            width="144"
-          />
-        </a>
-        <br />
-        Discord
+          <img src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://discord.com/invite/7eFwJQN3Fx&bgcolor=ffffff&color=111827&margin=8" alt="Discord QR" width="144" />
+        </a><br />Discord
       </td>
       <td align="center">
-        <img
-          src="https://dataagent.top/HKUSTGZ_DIAL.jpg"
-          alt="WeChat official account QR code"
-          width="144"
-        />
-        <br />
-        WeChat Official Account
+        <img src="https://dataagent.top/HKUSTGZ_DIAL.jpg" alt="WeChat QR" width="144" />
+        <br />WeChat Official Account
       </td>
     </tr>
   </table>
 </div>
-
-## Main Modules
-
-| Module | Responsibility |
-| --- | --- |
-| `src/data_agent_baseline/benchmark/dataset.py` | Public dataset loader |
-| `src/data_agent_baseline/tools/filesystem.py` | `list_context`, `read_csv`, `read_json`, `read_doc` |
-| `src/data_agent_baseline/tools/python_exec.py` | `execute_python` |
-| `src/data_agent_baseline/tools/sqlite.py` | `inspect_sqlite_schema`, `execute_context_sql` |
-| `src/data_agent_baseline/tools/registry.py` | Tool registration and terminal `answer` |
-| `src/data_agent_baseline/agents/prompt.py` | System prompt, task prompt, observation prompt |
-| `src/data_agent_baseline/agents/react.py` | ReAct runtime with JSON action protocol |
-| `src/data_agent_baseline/run/runner.py` | Single-task and benchmark execution |
