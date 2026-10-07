@@ -11,10 +11,12 @@ import re
 from dataclasses import dataclass, field
 
 from data_agent_baseline.agents.aggregate_grain import wants_dual_grain_check
+from data_agent_baseline.agents.dual_probe import format_dual_probe_block
 from data_agent_baseline.agents.predicate_scope import (
     wants_division_scope_check,
     wants_multi_avg_scope_check,
 )
+from data_agent_baseline.agents.question_route import classify_question
 from data_agent_baseline.agents.runtime import StepRecord
 from data_agent_baseline.agents.schema_link import AmbiguityGroup, SchemaLinkPlan
 from data_agent_baseline.agents.value_normalize import (
@@ -78,6 +80,7 @@ def build_hypotheses(
     hyps: list[Hypothesis] = []
     q = question or ""
     knowledge = knowledge_text or ""
+    kinds = classify_question(q)
 
     if link is not None:
         for index, group in enumerate(link.ambiguity_groups[:4]):
@@ -155,7 +158,24 @@ def build_hypotheses(
             )
         )
 
-    if _RATIO_Q_RE.search(q) and _KNOWLEDGE_DIVIDE_RE.search(knowledge):
+    if "ratio" in kinds:
+        hyps.append(
+            Hypothesis(
+                hid="ratio_direction",
+                title="Ratio direction (numerator / denominator reading)",
+                rationale=(
+                    "Ratio questions can have two self-consistent readings "
+                    "(A/B vs B/A, or votes BY an entity vs votes ON its rows). "
+                    "Probe both counts, then pick by: (a) knowledge.md; "
+                    "(b) direct foreign-key path; (c) fewest joins. Do not oscillate."
+                ),
+                probe_sql_hints=(
+                    "-- reading A: COUNT numerator / COUNT denominator",
+                    "-- reading B: invert the two counts",
+                ),
+            )
+        )
+    elif _RATIO_Q_RE.search(q) and _KNOWLEDGE_DIVIDE_RE.search(knowledge):
         hyps.append(
             Hypothesis(
                 hid="ratio_direction",
@@ -170,6 +190,40 @@ def build_hypotheses(
                 probe_sql_hints=(
                     "-- reading A: COUNT over the entity's own actions",
                     "-- reading B: COUNT over actions targeting the entity's rows",
+                ),
+            )
+        )
+
+    if "clinical" in kinds:
+        hyps.append(
+            Hypothesis(
+                hid="clinical_range",
+                title="Clinical normal range from knowledge/docs, not sample quantiles",
+                rationale=(
+                    "Do not treat Q1–Q3 / NTILE of this warehouse as 'normal'. "
+                    "Use a knowledge threshold, or search_docs for a documented range. "
+                    "If none exists, leave the bound UNDECIDED rather than inventing one."
+                ),
+                probe_sql_hints=(
+                    "-- knowledge-pattern: WHERE lab.<col> > <documented bound>",
+                    "-- forbidden: NTILE / percentile_cont as the normal band",
+                ),
+            )
+        )
+
+    if re.search(r"\b(?:type|category|description)\b", q, flags=re.IGNORECASE):
+        hyps.append(
+            Hypothesis(
+                hid="type_grain",
+                title="Type/category grain: entity vs line-item",
+                rationale=(
+                    "Questions that say type/category/description often have a coarse "
+                    "entity dimension and a fine expense/line description. Probe both "
+                    "GROUP BY grains and compare row counts before submitting."
+                ),
+                probe_sql_hints=(
+                    "-- coarse: GROUP BY event/budget type",
+                    "-- fine: GROUP BY description/line item",
                 ),
             )
         )
@@ -350,6 +404,8 @@ def evidence_guidance(
     steps: list[StepRecord],
     remaining_steps: int | None,
     normalize_plan: NormalizePlan | None = None,
+    extract_incomplete: bool = False,
+    knowledge_text: str = "",
 ) -> str:
     """Build an observation addendum when the loop is thrashing or near the end."""
     notes: list[str] = []
@@ -406,6 +462,20 @@ def evidence_guidance(
                 "checks (e.g. split_part / regexp '_N$') before final."
             )
             break
+
+    if extract_incomplete or evidence.consecutive_empty_probes >= 3:
+        notes.append(
+            "If a measure column is empty or a join key is missing, call "
+            "search_docs with the question entities. Do not submit constant 0."
+        )
+
+    dual = format_dual_probe_block(
+        question=question,
+        knowledge_text=knowledge_text,
+        steps=steps,
+    )
+    if dual and remaining_steps is not None and remaining_steps <= 8:
+        notes.append(dual.replace("\n", " | "))
 
     if remaining_steps is not None and remaining_steps <= 3:
         notes.append(

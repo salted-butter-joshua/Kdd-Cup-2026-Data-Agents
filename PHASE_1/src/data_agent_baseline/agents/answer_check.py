@@ -15,6 +15,7 @@ import re
 from typing import Any, Literal
 
 from data_agent_baseline.agents.model import ModelAdapter, ModelMessage
+from data_agent_baseline.agents.answer_contract import drop_unasked_sidecar_columns
 from data_agent_baseline.agents.runtime import StepRecord
 from data_agent_baseline.benchmark.schema import AnswerTable
 
@@ -523,6 +524,10 @@ def prune_answer_columns(
         check["single_metric_enforced"] = kept != before_single and can_enforce_single_metric(
             question, before_single
         )
+        after_sidecar = drop_unasked_sidecar_columns(question, kept)
+        if after_sidecar != kept:
+            check["sidecar_dropped"] = [name for name in kept if name not in after_sidecar]
+            kept = after_sidecar
 
         used_original = kept == proposed
         pruned = answer if used_original else project_answer(answer, kept)
@@ -538,22 +543,27 @@ def prune_answer_columns(
         # Inference failed → keep original columns (no aggressive hard prune).
         # Dual-condition single-metric may still apply when structure is unambiguous.
         try:
+            kept = list(proposed)
             if can_enforce_single_metric(question, proposed):
                 kept = enforce_single_metric_column(question, proposed)
-                if kept != proposed:
-                    pruned = project_answer(answer, kept)
-                    check.update(
-                        {
-                            "kept": list(pruned.columns),
-                            "dropped": [
-                                name for name in proposed if name not in pruned.columns
-                            ],
-                            "used_original": False,
-                            "single_metric_enforced": True,
-                            "error": str(exc),
-                        }
-                    )
-                    return pruned, check
+            kept = drop_unasked_sidecar_columns(question, kept)
+            if kept != proposed:
+                pruned = project_answer(answer, kept)
+                check.update(
+                    {
+                        "kept": list(pruned.columns),
+                        "dropped": [
+                            name for name in proposed if name not in pruned.columns
+                        ],
+                        "used_original": False,
+                        "single_metric_enforced": can_enforce_single_metric(
+                            question, proposed
+                        )
+                        and len(kept) == 1,
+                        "error": str(exc),
+                    }
+                )
+                return pruned, check
         except Exception:
             pass
         check["error"] = str(exc)

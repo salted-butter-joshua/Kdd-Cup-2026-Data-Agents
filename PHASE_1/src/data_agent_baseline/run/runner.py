@@ -241,6 +241,18 @@ def _run_single_task_core(
         public_dataset = DABenchPublicDataset(config.dataset.root_path)
         task = public_dataset.get_task(task_id)
 
+        from data_agent_baseline.run.task_budget import (
+            classify_task_budget,
+            get_current_budget,
+            set_current_budget,
+        )
+
+        budget = get_current_budget()
+        if budget is None:
+            budget = classify_task_budget(task.context_dir)
+            set_current_budget(budget)
+        mark("task_budget", **budget.to_mark())
+
         mark("build_model")
         resolved_model = model or build_model_adapter(config)
         owns_tools = tools is None
@@ -249,7 +261,7 @@ def _run_single_task_core(
         agent = ReActAgent(
             model=resolved_model,
             tools=resolved_tools,
-            config=ReActAgentConfig(max_steps=config.agent.max_steps),
+            config=ReActAgentConfig(max_steps=budget.max_steps),
         )
         try:
             mark("agent_run_start")
@@ -266,6 +278,12 @@ def _run_single_task_core(
     finally:
         if not defer_cleanup:
             clear_progress()
+            try:
+                from data_agent_baseline.run.task_budget import set_current_budget
+
+                set_current_budget(None)
+            except Exception:
+                pass
 
 
 def _run_single_task_in_subprocess(
@@ -394,6 +412,16 @@ def _run_single_task_with_timeout(
     progress_path: Path | None = None,
 ) -> dict[str, Any]:
     timeout_seconds = config.run.task_timeout_seconds
+    if timeout_seconds <= 0:
+        from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
+        from data_agent_baseline.run.task_budget import (
+            classify_task_budget,
+            process_kill_timeout,
+        )
+
+        task = DABenchPublicDataset(config.dataset.root_path).get_task(task_id)
+        budget = classify_task_budget(task.context_dir)
+        timeout_seconds = process_kill_timeout(budget)
     if timeout_seconds <= 0:
         return _run_single_task_core(task_id=task_id, config=config, progress_path=progress_path)
 

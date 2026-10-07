@@ -566,7 +566,13 @@ def build_warehouse(
         )
 
         _mark("warehouse_extract_docs")
-        extract_budget = ExtractionBudget.from_env()
+        from data_agent_baseline.run.task_budget import get_current_budget
+
+        tb = get_current_budget()
+        if tb is not None:
+            extract_budget = ExtractionBudget.from_env(seconds=tb.extract_seconds())
+        else:
+            extract_budget = ExtractionBudget.from_env()
         for extracted in extract_all_documents(
             context_dir, model, budget=extract_budget
         ):

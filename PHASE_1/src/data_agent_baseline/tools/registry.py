@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
+from data_agent_baseline.tools.doc_search import search_docs
 from data_agent_baseline.tools.warehouse import WarehouseSession, describe_tables, execute_sql
 
 PROBE_LIMIT_DEFAULT = 50
@@ -155,6 +156,16 @@ def create_default_tool_registry(model: Any | None = None) -> ToolRegistry:
             answer=answer,
         )
 
+    def _search_docs(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
+        query = str(action_input.get("query") or task.question or "").strip()
+        if not query:
+            return ToolExecutionResult(ok=False, content={"error": "search_docs.query is required."})
+        try:
+            max_hits = int(action_input.get("max_hits") or 4)
+        except (TypeError, ValueError):
+            max_hits = 4
+        return ToolExecutionResult(ok=True, content=search_docs(task, query, max_hits=max_hits))
+
     specs = {
         "list_tables": ToolSpec(
             name="list_tables",
@@ -190,10 +201,20 @@ def create_default_tool_registry(model: Any | None = None) -> ToolRegistry:
             ),
             input_schema={},
         ),
+        "search_docs": ToolSpec(
+            name="search_docs",
+            description=(
+                "Keyword search over this task's narrative doc/*.md (not knowledge.md, "
+                "not CSV). Returns scored snippets. Use when a warehouse column is empty "
+                "or a join key is missing. Snippets are not the answer table."
+            ),
+            input_schema={"query": "entity or measure words from the question", "max_hits": 4},
+        ),
     }
     handlers = {
         "list_tables": _list_tables,
         "run_sql": _run_sql,
         "answer": _answer,
+        "search_docs": _search_docs,
     }
     return ToolRegistry(specs=specs, handlers=handlers, session=session)

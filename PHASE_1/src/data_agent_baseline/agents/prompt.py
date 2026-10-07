@@ -133,7 +133,8 @@ Analysis constraints:
 20. Thresholds and denominators: use encodings and ranges only from knowledge or schema. Do not invent clinical "normal ranges".
 21. Final rows must come from `run_sql` with `final=true`. Probe LIMIT is not the answer. DuckDB dialect: double-quoted identifiers, single-quoted strings, TRY_CAST if needed.
 22. Before `answer`, keep only columns the question asks for. Extra columns are dropped at submit time by intersecting with columns inferred from the question.
-23. Document tables are already extracted. Query them with SQL using the file-stem name. Corrections in the source text (initially / previously / corrected) are already resolved to the last official value. Registry-phrase names beat adjective-prefixed aliases.
+23. Document tables are already extracted. Query them with SQL using the file-stem name. Corrections in the source text (initially / previously / corrected) are already resolved to the last official value. Registry-phrase names beat adjective-prefixed aliases. If a warehouse measure column is empty or a needed join key is missing, call `search_docs` (narrative md snippets only) instead of submitting 0.
+30. Dual tracks: for average+knowledge /N formulas, probe AVG(col) and SUM/N and compare magnitude — do not auto-pick. For ratios, probe A/B and B/A then pick by knowledge, then FK, then fewest joins. For type/category questions, probe coarse entity grain and fine description grain. For clinical 'normal', never use sample Q1/Q3.
 24. Time/date / value normalization: compare semantic values, not raw strings. Parse the question literal and knowledge unit (e.g. H:MM:SS vs M:SS.mmm); truncate stored values to the question's grain; treat 0:01:54 ≡ 01:54 ≡ 1:54. Prefer prefix / floor-seconds predicates over col = 'question text'. If a grain-matched probe already returned rows, call final=true with that predicate and keep ties — do not retreat to exact string equality.
 25. Scalar shape: for how-many / calculate / total / percentage questions, the final SELECT must be the metric itself (usually one column, one row). Do not overwrite a successful COUNT with entity-level detail rows.
 26. Status/metric questions: do not SELECT entity id columns alongside the status/metric unless the question asks for the id.
@@ -267,6 +268,7 @@ def build_observation_prompt(
     *,
     remaining_steps: int | None = None,
     evidence_notes: str | None = None,
+    progress_block: str | None = None,
 ) -> str:
     def _default(value: object) -> str:
         if isinstance(value, (bytes, bytearray)):
@@ -284,6 +286,9 @@ def build_observation_prompt(
     notes = (evidence_notes or "").strip()
     if notes:
         text += f"\n\nEvidence guidance:\n{notes}"
+    progress = (progress_block or "").strip()
+    if progress:
+        text += f"\n\n{progress}"
     if remaining_steps is not None and remaining_steps <= 2:
         text += (
             "\n\nYou have "

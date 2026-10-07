@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from data_agent_baseline.agents.answer_contract import question_wants_scalar_value
 from data_agent_baseline.agents.runtime import StepRecord
 
 # H:MM:SS(.mmm) or M:SS(.mmm) or compact times in questions.
@@ -283,6 +284,10 @@ def find_promotable_probe(
             continue
         count = content.get("row_count")
         if not isinstance(count, int) or count <= 0:
+            continue
+        if question_wants_scalar_value(question) and (
+            count != 1 or len(content.get("columns") or []) > 2
+        ):
             continue
         if not sql_uses_coarse_time_match(sql, plan) and not _probe_mentions_canon(sql, plan):
             continue

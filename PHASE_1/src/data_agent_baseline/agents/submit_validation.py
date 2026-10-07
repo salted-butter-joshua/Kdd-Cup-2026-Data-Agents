@@ -351,19 +351,15 @@ def submit_symmetric_relation_rejection(
     sql: str | None,
     state: WarehouseState | None,
 ) -> dict[str, Any] | None:
-    """Reject row counts on symmetric relationship tables.
+    """Reject COUNT(*) / COUNT(entity) on tables that store each edge twice.
 
-    If the final SQL counts rows of a relationship table that stores each
-    relationship in both directions, it should count DISTINCT relationship ids.
-    Already-correct COUNT(DISTINCT rel_id) forms are allowed through.
+    COUNT(DISTINCT relationship_id) (including CASE expressions that select
+    those ids) is allowed through. Missing warehouse evidence → pass.
     """
     if not sql or state is None:
         return None
     sql_text = sql or ""
     if not (_COUNT_STAR_RE.search(sql_text) or _COUNT_COL_RE.search(sql_text)):
-        return None
-    # P0: do not reject SQL that already DISTINCT-counts the relationship id.
-    if _counts_distinct_relation_id(sql_text):
         return None
     final_tables = _extract_from_tables(sql_text)
     if not final_tables:
@@ -376,16 +372,18 @@ def submit_symmetric_relation_rejection(
         is_sym, dup_count = _relation_is_symmetric(state, rel_table)
         if not is_sym:
             continue
+        if _counts_distinct_relation_id(sql_text):
+            return None
         return {
             "ok": False,
             "error": (
                 f"answer rejected: '{rel_table}' stores each relationship multiple "
-                f"times (example relationship id appears {dup_count} times)."
+                f"times (example relationship id appears {dup_count} times). "
+                "COUNT(*) / COUNT(entity) will double-count."
             ),
             "hint": (
-                "Do not COUNT(*) or COUNT(entity_column) on a symmetric relationship "
-                "table. Use COUNT(DISTINCT relationship_id) instead, where "
-                "relationship_id is the identifier of the bond/edge/connection itself."
+                "Count DISTINCT relationship ids (e.g. COUNT(DISTINCT bond_id)), "
+                "not COUNT(*) on the relationship table."
             ),
             "relation_check": {
                 "relation_table": rel_table,

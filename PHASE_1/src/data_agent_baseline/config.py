@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from data_agent_baseline.agents.model import PROVIDER_DEFAULTS, normalize_provider
+from data_agent_baseline.agents.model import PROVIDER_DEFAULTS, normalize_api_base, normalize_provider
 from pathlib import Path
 
 import yaml
@@ -44,7 +44,7 @@ class RunConfig:
     output_dir: Path = field(default_factory=_default_run_output_dir)
     run_id: str | None = None
     max_workers: int = 4
-    task_timeout_seconds: int = 300
+    task_timeout_seconds: int = 0
     empty_retries: int = 0
 
 
@@ -78,7 +78,7 @@ def _path_value(raw_value: str | None, default_value: Path) -> Path:
 
 
 def load_app_config(config_path: Path) -> AppConfig:
-    payload = yaml.safe_load(config_path.read_text()) or {}
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     dataset_defaults = DatasetConfig()
     agent_defaults = AgentConfig()
     run_defaults = RunConfig()
@@ -105,6 +105,7 @@ def load_app_config(config_path: Path) -> AppConfig:
         api_base = str(provider_defaults["api_base"])
     else:
         api_base = str(raw_api_base).strip()
+    api_base = normalize_api_base(api_base)
 
     reasoning_split_raw = agent_payload.get("reasoning_split", agent_defaults.reasoning_split)
     if reasoning_split_raw is None:

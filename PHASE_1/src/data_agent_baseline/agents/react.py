@@ -15,10 +15,19 @@ from data_agent_baseline.agents.answer_check import (
     has_full_sql_scan,
     sql_answer_rejected_observation,
 )
+from data_agent_baseline.agents.dual_probe import (
+    format_dual_probe_block,
+    submit_quantile_normal_rejection,
+)
 from data_agent_baseline.agents.gate_common import is_undecided
 from data_agent_baseline.agents.grain_contract import (
     submit_grain_contract_post,
     submit_grain_contract_pre,
+)
+from data_agent_baseline.agents.episode import (
+    EpisodeState,
+    build_plan0,
+    pack_step_window,
 )
 from data_agent_baseline.agents.hypothesis import (
     EvidenceState,
@@ -225,6 +234,20 @@ class ReActAgent:
             tables=tables,
         )
 
+    def _table_count(self) -> int:
+        session = self.tools.session
+        state = getattr(session, "state", None) if session is not None else None
+        tables = getattr(state, "tables", None) if state is not None else None
+        return len(tables or [])
+
+    def _remaining_seconds(self) -> float | None:
+        from data_agent_baseline.run.task_budget import get_current_budget
+
+        tb = get_current_budget()
+        if tb is None:
+            return None
+        return tb.remaining_task()
+
     def _build_messages(
         self,
         task: PublicTask,
@@ -238,6 +261,7 @@ class ReActAgent:
         evidence: EvidenceState,
         hypotheses: list[Hypothesis],
         normalize_plan: NormalizePlan,
+        episode: EpisodeState,
     ) -> list[ModelMessage]:
         system_content = build_system_prompt(
             self.tools.describe_for_prompt(),
@@ -258,9 +282,43 @@ class ReActAgent:
             )
         )
         remaining_after_last = max(self.config.max_steps - len(state.steps), 0)
-        for index, step in enumerate(state.steps):
-            messages.append(ModelMessage(role="assistant", content=step.raw_response))
-            is_last = index == len(state.steps) - 1
+        folded, recent = pack_step_window(state.steps)
+        remaining_seconds = self._remaining_seconds()
+        from data_agent_baseline.run.task_budget import get_current_budget
+
+        tb = get_current_budget()
+        extract_incomplete = False
+        if tb is not None:
+            doc_tables = 0
+            session = self.tools.session
+            wstate = getattr(session, "state", None) if session is not None else None
+            for table in getattr(wstate, "tables", None) or []:
+                if getattr(table, "source_type", "") == "doc":
+                    doc_tables += 1
+            extract_incomplete = tb.n_doc_files > doc_tables
+        if folded:
+            messages.append(
+                ModelMessage(
+                    role="user",
+                    content=episode.format_progress(
+                        remaining_seconds=remaining_seconds,
+                        remaining_steps=remaining_after_last,
+                        table_count=self._table_count(),
+                        extract_incomplete=extract_incomplete,
+                        dual_block=format_dual_probe_block(
+                            question=task.question,
+                            knowledge_text=knowledge_text,
+                            steps=state.steps,
+                        ),
+                    )
+                    + f"\nEarlier steps folded: {len(folded)} (do not retry banned fingerprints).",
+                )
+            )
+        for index, step in enumerate(recent):
+            raw = step.raw_response or ""
+            if raw:
+                messages.append(ModelMessage(role="assistant", content=raw))
+            is_last = index == len(recent) - 1
             remaining_steps = remaining_after_last if is_last else None
             notes = None
             if is_last:
@@ -271,7 +329,22 @@ class ReActAgent:
                     steps=state.steps,
                     remaining_steps=remaining_steps,
                     normalize_plan=normalize_plan,
+                    extract_incomplete=extract_incomplete,
+                    knowledge_text=knowledge_text,
                 ) or None
+            progress = None
+            if is_last:
+                progress = episode.format_progress(
+                    remaining_seconds=remaining_seconds,
+                    remaining_steps=remaining_steps,
+                    table_count=self._table_count(),
+                    extract_incomplete=extract_incomplete,
+                    dual_block=format_dual_probe_block(
+                        question=task.question,
+                        knowledge_text=knowledge_text,
+                        steps=state.steps,
+                    ),
+                )
             messages.append(
                 ModelMessage(
                     role="user",
@@ -279,6 +352,18 @@ class ReActAgent:
                         step.observation,
                         remaining_steps=remaining_steps,
                         evidence_notes=notes,
+                        progress_block=progress,
+                    ),
+                )
+            )
+        if episode.parse_errors >= 2:
+            messages.append(
+                ModelMessage(
+                    role="user",
+                    content=(
+                        "Last replies were not valid JSON. Return only one ```json block "
+                        'with thought, action, action_input. Example: '
+                        '{"thought":"list tables","action":"list_tables","action_input":{}}'
                     ),
                 )
             )
@@ -299,6 +384,7 @@ class ReActAgent:
         self._knowledge_text = ""
         self._schema_link: SchemaLinkPlan | None = None
         self._normalize_plan = normalize_plan
+        episode = EpisodeState()
         try:
             _mark("prepare_knowledge")
             knowledge_text = self._prepare_knowledge(task)
@@ -393,8 +479,52 @@ class ReActAgent:
                 )
             )
 
+        table_count = self._table_count()
+        episode.empty_warehouse = table_count <= 0
+        extract_incomplete = False
+        from data_agent_baseline.run.task_budget import get_current_budget
+
+        tb = get_current_budget()
+        if tb is not None:
+            doc_tables = 0
+            session = self.tools.session
+            wstate = getattr(session, "state", None) if session is not None else None
+            for table in getattr(wstate, "tables", None) or []:
+                if getattr(table, "source_type", "") == "doc":
+                    doc_tables += 1
+            extract_incomplete = tb.n_doc_files > doc_tables
+            if tb.max_steps != self.config.max_steps:
+                self.config = ReActAgentConfig(max_steps=tb.max_steps)
+        episode.plan_text = build_plan0(
+            question=task.question,
+            hypotheses=hypotheses,
+            link=getattr(self, "_schema_link", None),
+            table_count=table_count,
+            extract_incomplete=extract_incomplete,
+        )
+        _mark("episode_plan0", plan=episode.plan_text[:300], tables=table_count)
+        self._episode = episode
+
         for step_index in range(1, self.config.max_steps + 1):
             raw_response = ""
+            if episode.should_stop_empty_warehouse():
+                state.failure_reason = (
+                    "Warehouse has no tables; stopped catalog exploration."
+                )
+                break
+            remaining_sec = self._remaining_seconds()
+            remaining_steps = self.config.max_steps - step_index + 1
+            if remaining_sec is not None and remaining_sec < 65:
+                if self._try_fallback_submit(task, state):
+                    break
+                if remaining_sec < 20:
+                    state.failure_reason = (
+                        "Task time budget exhausted before a valid submit."
+                    )
+                    break
+            if remaining_steps <= 2 and state.answer is None:
+                if self._try_fallback_submit(task, state):
+                    break
             try:
                 _mark("react_model_call", step=step_index)
                 raw_response = self.model.complete(
@@ -409,12 +539,14 @@ class ReActAgent:
                         evidence=evidence,
                         hypotheses=hypotheses,
                         normalize_plan=normalize_plan,
+                        episode=episode,
                     )
                 )
                 _mark("react_model_done", step=step_index, response_chars=len(raw_response or ""))
                 model_step = parse_model_step(raw_response)
+                episode.reset_parse_errors()
                 _mark("react_tool", step=step_index, action=model_step.action)
-                tool_result = self._execute_checked_action(task, state, model_step)
+                tool_result = self._execute_checked_action(task, state, model_step, episode)
                 _mark("react_tool_done", step=step_index, action=model_step.action, ok=tool_result.ok)
                 if (
                     not tool_result.ok
@@ -442,11 +574,13 @@ class ReActAgent:
                     step_record,
                     normalize_plan=normalize_plan,
                 )
+                episode.maybe_replan(empty_streak=evidence.consecutive_empty_probes)
                 if tool_result.is_terminal:
                     state.answer = tool_result.answer
                     break
             except Exception as exc:
                 err = str(exc).strip() or type(exc).__name__
+                episode.record_parse_error()
                 observation = {
                     "ok": False,
                     "error": err,
@@ -515,6 +649,15 @@ class ReActAgent:
                 steps=state.steps,
                 plan=plan,
             )
+            if promoted is None:
+                episode = getattr(self, "_episode", None)
+                best = (
+                    episode.best_probe_for(task.question)
+                    if episode is not None
+                    else None
+                )
+                if best is not None and best.row_count > 0:
+                    promoted = (best.sql, f"episode_best_rows={best.row_count}")
             if promoted is None:
                 return
             sql, promo_reason = promoted
@@ -602,7 +745,23 @@ class ReActAgent:
         task: PublicTask,
         state: AgentRuntimeState,
         model_step: ModelStep,
+        episode: EpisodeState | None = None,
     ) -> ToolExecutionResult:
+        episode = episode or getattr(self, "_episode", None)
+        if model_step.action == "run_sql" and isinstance(model_step.action_input, dict):
+            sql = str(model_step.action_input.get("sql") or "")
+            if episode is not None:
+                banned = episode.gate_sql(sql)
+                if banned:
+                    return ToolExecutionResult(
+                        ok=False,
+                        content={
+                            "error": banned,
+                            "sql": sql,
+                            "episode_ban": True,
+                            "hint": "Pick a new SELECT on warehouse tables, or final=true on best_probe.",
+                        },
+                    )
         if model_step.action == "answer" and not has_full_sql_scan(state.steps):
             result = self._maybe_reject(state, sql_answer_rejected_observation())
             if result is not None:
@@ -640,6 +799,19 @@ class ReActAgent:
                         return result
 
         tool_result = self.tools.execute(task, model_step.action, model_step.action_input)
+        if episode is not None:
+            if model_step.action == "list_tables" and isinstance(tool_result.content, dict):
+                episode.observe_list_tables(int(tool_result.content.get("table_count") or 0))
+            elif model_step.action == "run_sql" and isinstance(model_step.action_input, dict):
+                sql = str(model_step.action_input.get("sql") or "")
+                content = tool_result.content if isinstance(tool_result.content, dict) else {}
+                episode.record_sql_result(
+                    sql=sql,
+                    ok=tool_result.ok,
+                    row_count=content.get("row_count") if tool_result.ok else None,
+                    columns=list(content.get("columns") or []) if tool_result.ok else None,
+                    error=str(content.get("error") or "") if not tool_result.ok else None,
+                )
         if (
             tool_result.ok
             and model_step.action == "run_sql"
@@ -685,6 +857,7 @@ class ReActAgent:
             state.steps,
             sql=session.last_final_sql if session is not None else None,
             answer=tool_result.answer,
+            state=session.state if session is not None else None,
         )
         if membership is not None:
             result = self._maybe_reject(state, membership)
@@ -740,6 +913,16 @@ class ReActAgent:
         )
         if relation is not None:
             result = self._maybe_reject(state, relation)
+            if result is not None:
+                return result
+
+        quantile = submit_quantile_normal_rejection(
+            task.question,
+            getattr(self, "_knowledge_text", None),
+            sql=session.last_final_sql if session is not None else None,
+        )
+        if quantile is not None:
+            result = self._maybe_reject(state, quantile)
             if result is not None:
                 return result
 

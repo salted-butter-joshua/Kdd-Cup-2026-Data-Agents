@@ -1,22 +1,19 @@
-"""Soft voting among final candidate SQLs when the ReAct loop times out.
+"""Vote among final candidate SQLs when the ReAct loop times out.
 
-Picks the best last_final-style candidate using cheap heuristics — not gold-chasing.
+Picks by execution-result agreement, not max row count.
 """
 
 from __future__ import annotations
 
-import re
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
 
-from data_agent_baseline.agents.runtime import StepRecord
-
-_LIMIT_ONE_RE = re.compile(r"\bLIMIT\s+1\b", flags=re.IGNORECASE)
-_LIST_Q_RE = re.compile(
-    r"\b(?:which|what)\b.+\b(?:races?|names?|ids?|elements?|types?|items?)\b|"
-    r"\blist\b|\btally\b|\ball\b",
-    flags=re.IGNORECASE,
+from data_agent_baseline.agents.answer_contract import (
+    question_wants_list,
+    question_wants_scalar_value,
+    result_fingerprint,
 )
+from data_agent_baseline.agents.runtime import StepRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,34 +57,56 @@ def vote_best_final(
     question: str,
     steps: list[StepRecord],
 ) -> VoteCandidate | None:
-    """Score final=true successful runs; prefer non-empty, list-friendly shapes."""
+    """Cluster successful finals by result fingerprint; take the largest cluster."""
     candidates = collect_final_candidates(steps)
     if not candidates:
         return None
 
-    list_shaped = bool(_LIST_Q_RE.search(question or ""))
-    best: VoteCandidate | None = None
+    scalar = question_wants_scalar_value(question)
+    list_shaped = question_wants_list(question)
+    clusters: dict[tuple, list[tuple[int, StepRecord, str]]] = defaultdict(list)
     for index, step, sql in candidates:
         count = _row_count(step)
-        score = 0.0
-        reasons: list[str] = []
-        if count is None:
-            score -= 2.0
-            reasons.append("unknown_rows")
-        elif count == 0:
-            score -= 5.0
-            reasons.append("empty")
-        else:
-            score += 3.0
-            reasons.append(f"rows={count}")
-            if list_shaped and count > 1:
-                score += 2.0
-                reasons.append("list_ok")
-            if list_shaped and count == 1 and _LIMIT_ONE_RE.search(sql):
-                score -= 1.5
-                reasons.append("suspicious_limit1")
-        # Prefer later successful finals slightly (more informed).
-        score += index * 0.05
+        if count == 0:
+            continue
+        obs = step.observation if isinstance(step.observation, dict) else {}
+        clusters[result_fingerprint(obs)].append((index, step, sql))
+
+    if not clusters:
+        return None
+
+    ranked = sorted(
+        clusters.items(),
+        key=lambda item: (
+            len(item[1]),
+            -item[0][0] if item[0][0] else 0,
+            item[1][-1][0],
+        ),
+        reverse=True,
+    )
+
+    best: VoteCandidate | None = None
+    for fingerprint, members in ranked:
+        n_cols, n_rows, _cells = fingerprint
+        cluster_n = len(members)
+        index, step, sql = members[-1]
+        score = cluster_n * 5.0
+        reasons = [f"cluster={cluster_n}", f"rows={n_rows}", f"cols={n_cols}"]
+        if n_rows is not None and n_rows <= 0:
+            continue
+        if scalar:
+            if n_rows == 1 and n_cols <= 2:
+                score += 4.0
+                reasons.append("scalar_ok")
+            else:
+                score -= 12.0
+                reasons.append("scalar_wide")
+        elif list_shaped and isinstance(n_rows, int) and n_rows > 1:
+            score += 1.0
+            reasons.append("list_ok")
+        if n_cols:
+            score += 1.0 / n_cols
+        score += index * 0.01
         cand = VoteCandidate(
             sql=sql,
             score=score,
@@ -96,4 +115,9 @@ def vote_best_final(
         )
         if best is None or cand.score > best.score:
             best = cand
+
+    if best is None:
+        return None
+    if scalar and best.score < 0:
+        return None
     return best

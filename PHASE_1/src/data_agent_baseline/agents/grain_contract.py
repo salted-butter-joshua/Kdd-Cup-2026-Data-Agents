@@ -29,6 +29,7 @@ from data_agent_baseline.agents.submit_validation import (
     submit_membership_rejection,
 )
 from data_agent_baseline.benchmark.schema import AnswerTable
+from data_agent_baseline.tools.warehouse import WarehouseState
 
 
 def submit_grain_contract_pre(
@@ -53,6 +54,7 @@ def submit_grain_contract_post(
     steps: list[StepRecord],
     sql: str | None,
     answer: AnswerTable,
+    state: WarehouseState | None = None,
 ) -> dict[str, Any] | None:
     """Post-answer contract check: member expansion beyond the filter grain."""
     payload = submit_membership_rejection(steps, sql, answer)
@@ -62,4 +64,5 @@ def submit_grain_contract_post(
     payload = submit_member_expansion_rejection(question, steps, sql, answer)
     if payload is not None:
         payload.setdefault("grain_contract", True)
-    return payload
+        return payload
+    return None

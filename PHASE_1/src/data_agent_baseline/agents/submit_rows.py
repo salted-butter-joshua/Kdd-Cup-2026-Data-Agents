@@ -149,6 +149,13 @@ def submit_row_rejection(
     state: WarehouseState | None,
 ) -> dict[str, Any] | None:
     """Return a rejection observation, or None when the answer may be submitted."""
+    from data_agent_baseline.agents.answer_contract import (
+        question_allows_single_row_cutoff,
+        sql_has_maxmin_equality,
+        sql_is_global_aggregate,
+        submit_fake_zero_rejection,
+    )
+
     row_count = len(answer.rows)
     if row_count == 0:
         bounds = column_bounds(state, sql or "") if state is not None and sql else []
@@ -169,22 +176,39 @@ def submit_row_rejection(
             },
         }
 
-    if not sql or state is None or not question_is_open_extremum(question):
+    fake_zero = submit_fake_zero_rejection(
+        question, answer, sql=sql, state=state
+    )
+    if fake_zero is not None:
+        return fake_zero
+
+    if not sql or state is None:
         return None
-    limit = trailing_limit(sql)
-    if limit is None:
+    if sql_is_global_aggregate(sql):
+        return None
+    if question_allows_single_row_cutoff(question):
         return None
     top_n = explicit_top_n(question)
-    if top_n is not None and top_n == limit:
+    limit = trailing_limit(sql)
+    if top_n is not None and limit is not None and top_n == limit:
         return None
+    # Only LIMIT 1 is a singleton cutoff. LIMIT 10 dumps / probes are not.
+    # Keep col=(SELECT MIN/MAX …): that predicate *is* the extremum filter.
+    # Stripping it counts every peer row (task_75: 22 q2 times vs 1 unique min).
+    if limit != 1:
+        return None
+
     hit_count = count_without_limit(state, sql)
     if hit_count is None:
-        if limit == 1:
-            return _tie_rejection(sql, limit, None, row_count)
         return None
-    if hit_count > row_count:
-        return _tie_rejection(sql, limit, hit_count, row_count)
-    return None
+    if hit_count <= row_count:
+        return None
+    # Extremum + ORDER BY LIMIT 1: without-LIMIT count is the whole ordered
+    # set, not ties. Evidence missing → fail open. Ties at MIN/MAX equality
+    # still show up because the predicate is kept after LIMIT is stripped.
+    if question_is_open_extremum(question) and not sql_has_maxmin_equality(sql):
+        return None
+    return _tie_rejection(sql, limit, hit_count, row_count)
 
 
 def _tie_rejection(
@@ -196,12 +220,13 @@ def _tie_rejection(
     return {
         "ok": False,
         "error": (
-            "answer rejected: extremum query uses LIMIT and returns fewer rows "
-            "than the same query without LIMIT."
+            "answer rejected: final SQL uses LIMIT/MAX cutoff and returns fewer "
+            "rows than the same filter without that cutoff."
         ),
         "hint": (
-            "Use WHERE col = (SELECT MIN(col) ...) or MAX, and return every tied row. "
-            "Do not use ORDER BY … LIMIT 1 unless the question asks for one winner."
+            "Submit every matching row. Do not ORDER BY … LIMIT 1 unless the "
+            "question asks for latest/only/top-1. col = (SELECT MIN/MAX …) "
+            "without LIMIT is a valid unique-extremum filter."
         ),
         "tie_check": {
             "limit": limit,

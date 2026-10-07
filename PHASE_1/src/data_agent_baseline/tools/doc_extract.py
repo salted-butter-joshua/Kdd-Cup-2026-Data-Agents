@@ -1693,6 +1693,23 @@ def extract_document(
             doc = _upgrade_cached_doc(doc, path, cache_file, context_dir)
         _mark("extract_cache_hit", file=source_rel, rows=len(doc.rows))
         return doc
+    from data_agent_baseline.run.task_budget import get_current_budget
+
+    tb = get_current_budget()
+    if tb is not None and tb.should_stop_extract():
+        if tb.tier == "medium":
+            tb.maybe_upgrade_to_hard()
+            extra = tb.extract_seconds()
+            if extra > EXTRACT_SEC_PER_CALL and budget is not None:
+                budget.deadline = time.perf_counter() + extra
+        if tb.should_stop_extract():
+            _mark(
+                "extract_doc_abandoned",
+                file=source_rel,
+                error="solve reserve reached; skip cold extract",
+                stage="plan",
+            )
+            return None
     if model is None:
         return None
     paragraphs = split_paragraphs(path.read_text(encoding="utf-8", errors="replace"))
